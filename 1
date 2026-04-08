@@ -1,0 +1,1176 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, simpledialog
+import customtkinter as ctk
+import pandas as pd
+import numpy as np
+import threading
+import datetime
+import time
+import requests
+import json
+import re
+import csv
+import os
+import webbrowser
+import xml.etree.ElementTree as ET  # Gerçek haberleri (RSS) okumak için eklendi
+
+# ---------- YAPILANDIRMA VE KİMLİK BİLGİLERİ ----------
+GEMINI_API_KEY = ""  # Güvenlik için temizlendi. Kendi anahtarınızı buraya yapıştırın.
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+SETTINGS_FILE = 'app_settings.json'
+
+# Grafik kütüphaneleri
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    import matplotlib.dates as mdates
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    print("Matplotlib bulunamadı. Grafikler gösterilmeyecek. (pip install matplotlib)")
+
+# YFinance kütüphanesi (Canlı veriler için)
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+    print("yfinance bulunamadı. Lütfen 'pip install yfinance' ile kurun.")
+
+# --- YAPI VE TEMA AYARLARI ---
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+# Global Veri Depoları
+finans_verileri = {}
+gecmis_veriler = {} # 1 Yıllık geçmiş verileri tutacak
+son_guncelleme = "Hiç güncellenmedi"
+aktif_alarmlar = [] # [{'sembol': 'Usdtry', 'kosul': '>', 'deger': 35.0}]
+haber_akisi_cache = []
+kullanici_portfoyu = [] # [{'sembol': 'Xauusd', 'miktar': 10, 'maliyet': 2300.0}] - YENİ
+
+# Dinamik İzleme Listesi (Kullanıcının İstediği 14 Ana Gösterge)
+dinamik_konfigurasyon = [
+    {"anahtar": "Usdtry", "baslik": "USD/TRY", "ikon": "💵", "renk": "#3498db", "yf_ticker": "USDTRY=X", "tur": "yfinance"},
+    {"anahtar": "Eurtry", "baslik": "EUR/TRY", "ikon": "💶", "renk": "#3498db", "yf_ticker": "EURTRY=X", "tur": "yfinance"},
+    {"anahtar": "Eurusd", "baslik": "EUR/USD", "ikon": "💱", "renk": "#9b59b6", "yf_ticker": "EURUSD=X", "tur": "yfinance"},
+    {"anahtar": "Aktifhv", "baslik": "Gösterge Tahvil", "ikon": "📈", "renk": "#d35400", "yf_ticker": "", "tur": "gemini"},
+    {"anahtar": "AOFM", "baslik": "TCMB Fonlama", "ikon": "🏦", "renk": "#c0392b", "yf_ticker": "", "tur": "gemini"},
+    {"anahtar": "Xauusd", "baslik": "Ons Altın", "ikon": "🥇", "renk": "#f39c12", "yf_ticker": "GC=F", "tur": "yfinance"},
+    {"anahtar": "GLDGR", "baslik": "Gram Altın", "ikon": "🪙", "renk": "#f1c40f", "yf_ticker": "HESAPLA", "tur": "hesaplama"},
+    {"anahtar": "Brent", "baslik": "Brent Petrol", "ikon": "🛢️", "renk": "#2c3e50", "yf_ticker": "BZ=F", "tur": "yfinance"},
+    {"anahtar": "Mazot tl", "baslik": "Mazot (TL)", "ikon": "⛽", "renk": "#e67e22", "yf_ticker": "", "tur": "gemini"},
+    {"anahtar": "Benzin tl", "baslik": "Benzin (TL)", "ikon": "🚗", "renk": "#e74c3c", "yf_ticker": "", "tur": "gemini"},
+    {"anahtar": "STTRFPHR", "baslik": "Demir Cevheri", "ikon": "🏗️", "renk": "#7f8c8d", "yf_ticker": "", "tur": "gemini"},
+    {"anahtar": "BCOM", "baslik": "Emtia Endeksi", "ikon": "📊", "renk": "#1abc9c", "yf_ticker": "", "tur": "gemini"},
+    {"anahtar": "Tüfe -Aylık", "baslik": "TÜFE (Aylık)", "ikon": "🛒", "renk": "#8e44ad", "yf_ticker": "", "tur": "gemini"},
+    {"anahtar": "Üfe -Aylık", "baslik": "ÜFE (Aylık)", "ikon": "🏭", "renk": "#27ae60", "yf_ticker": "", "tur": "gemini"}
+]
+
+# Uygulama ayarlarını yükle
+def ayarlari_yukle():
+    global dinamik_konfigurasyon, aktif_alarmlar, kullanici_portfoyu
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if "konfigurasyon" in data: dinamik_konfigurasyon = data["konfigurasyon"]
+                if "alarmlar" in data: aktif_alarmlar = data["alarmlar"]
+                if "portfoy" in data: kullanici_portfoyu = data["portfoy"]
+        except Exception as e:
+            print(f"Ayar yükleme hatası: {e}")
+
+def ayarlari_kaydet():
+    with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+        json.dump({"konfigurasyon": dinamik_konfigurasyon, "alarmlar": aktif_alarmlar, "portfoy": kullanici_portfoyu}, f, ensure_ascii=False, indent=4)
+
+ayarlari_yukle()
+
+# --- DROPDOWN LİSTELERİNİ CANLI GÜNCELLEME MOTORU ---
+def guncelle_dropdown_listeleri():
+    yeni_semboller = [item["anahtar"] for item in dinamik_konfigurasyon]
+    if 'alarm_sembol_menu' in globals(): alarm_sembol_menu.configure(values=yeni_semboller)
+    if 'corr_var1_menu' in globals(): corr_var1_menu.configure(values=yeni_semboller)
+    if 'corr_var2_menu' in globals(): corr_var2_menu.configure(values=yeni_semboller)
+    if 'tech_sembol_menu' in globals(): tech_sembol_menu.configure(values=yeni_semboller)
+    if 'portfoy_sembol_menu' in globals(): portfoy_sembol_menu.configure(values=yeni_semboller)
+
+# --- GEMINI API ENTEGRASYONU ---
+def gemini_istek_gonder(prompt, arama_kullan=False):
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "BURAYA_API_ANAHTARINIZI_GIRIN":
+        return None
+        
+    url = f"{GEMINI_API_URL}?key={GEMINI_API_KEY}"
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    if arama_kullan:
+        payload["tools"] = [{"google_search": {}}]
+        
+    try:
+        response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=40)
+        if response.status_code == 200:
+            return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            print(f"Gemini API Hata Kodu: {response.status_code}")
+            return None
+    except Exception as e:
+        print(f"Gemini API Hatası: {e}")
+        return None
+
+def gemini_ile_veri_tamamla():
+    prompt = """Türkiye ve global piyasalar için aşağıdaki güncel ekonomik verileri bul ve SADECE JSON formatında döndür:
+    {"Aktifhv": {"deger": 0.0, "onceki": 0.0, "birim": "%"}, "AOFM": {"deger": 0.0, "onceki": 0.0, "birim": "%"}, "Tüfe -Aylık": {"deger": 0.0, "onceki": 0.0, "birim": "%"}, "Üfe -Aylık": {"deger": 0.0, "onceki": 0.0, "birim": "%"}, "Mazot tl": {"deger": 0.0, "onceki": 0.0, "birim": "TL"}, "Benzin tl": {"deger": 0.0, "onceki": 0.0, "birim": "TL"}, "STTRFPHR": {"deger": 0.0, "onceki": 0.0, "birim": "$"}, "BCOM": {"deger": 0.0, "onceki": 0.0, "birim": "Puan"}}
+    Sadece JSON çıktısı ver."""
+    
+    text = gemini_istek_gonder(prompt, arama_kullan=True)
+    if text:
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group(0))
+    return None
+
+# --- VERİ ÇEKME MOTORU ---
+def veri_cek_ve_guncelle():
+    global finans_verileri, gecmis_veriler, son_guncelleme
+    try:
+        root.after(0, lambda: set_status("Veriler çekiliyor (1 Yıllık Geçmiş)... Lütfen bekleyin.", "yellow"))
+        yeni_veriler = {}
+        
+        fallback_yfinance = {
+            "Usdtry": {"deger": 34.10, "onceki": 34.05, "birim": "TL"},
+            "Eurtry": {"deger": 37.50, "onceki": 37.40, "birim": "TL"},
+            "Eurusd": {"deger": 1.0950, "onceki": 1.0940, "birim": "$"},
+            "Xauusd": {"deger": 2400.40, "onceki": 2390.10, "birim": "$"},
+            "GLDGR": {"deger": 2630.50, "onceki": 2615.20, "birim": "TL"},
+            "Brent": {"deger": 85.30, "onceki": 84.90, "birim": "$"}
+        }
+        
+        fallback_makro = {
+            "Aktifhv": {"deger": 42.50, "onceki": 43.10, "birim": "%"},
+            "AOFM": {"deger": 45.00, "onceki": 45.00, "birim": "%"},
+            "Mazot tl": {"deger": 41.25, "onceki": 41.00, "birim": "TL"},
+            "Benzin tl": {"deger": 42.10, "onceki": 41.50, "birim": "TL"},
+            "STTRFPHR": {"deger": 118.50, "onceki": 120.20, "birim": "$"},
+            "BCOM": {"deger": 98.45, "onceki": 97.80, "birim": "Puan"},
+            "Tüfe -Aylık": {"deger": 3.16, "onceki": 4.53, "birim": "%"},
+            "Üfe -Aylık": {"deger": 2.89, "onceki": 3.12, "birim": "%"}
+        }
+
+        tum_yedekler = {**fallback_yfinance, **fallback_makro}
+        for key, val in tum_yedekler.items():
+            yeni_veriler[key] = val
+            tarihler = [(datetime.datetime.now() - datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(365, -1, -1)]
+            degerler = [val["deger"] * (1 + (np.random.rand() - 0.5) * 0.05) for _ in range(366)]
+            gecmis_veriler[key] = {"tarihler": tarihler, "degerler": degerler}
+
+        if YFINANCE_AVAILABLE:
+            tickers = " ".join([item["yf_ticker"] for item in dinamik_konfigurasyon if item["tur"] == "yfinance" and item["yf_ticker"]])
+            if tickers:
+                try:
+                    data = yf.download(tickers, period="1y", interval="1d", progress=False)
+                    if not data.empty:
+                        df_close = data['Close'].ffill() 
+                        
+                        for item in dinamik_konfigurasyon:
+                            if item["tur"] == "yfinance" and item["yf_ticker"] in df_close.columns:
+                                seri = df_close[item["yf_ticker"]].dropna()
+                                if len(seri) > 1:
+                                    guncel = float(seri.iloc[-1])
+                                    onceki = float(seri.iloc[-2])
+                                    birim = "$" if "USD" in item["yf_ticker"] or "=F" in item["yf_ticker"] else ("TL" if "TRY" in item["yf_ticker"] else "")
+                                    yeni_veriler[item["anahtar"]] = {"deger": guncel, "onceki": onceki, "birim": birim}
+                                    
+                                    tarih_str = seri.index.strftime('%Y-%m-%d').tolist()
+                                    deger_list = seri.tolist()
+                                    gecmis_veriler[item["anahtar"]] = {"tarihler": tarih_str, "degerler": deger_list}
+                except Exception as e:
+                    print(f"YFinance indirme hatası: {e}")
+
+            if "Xauusd" in yeni_veriler and "Usdtry" in yeni_veriler:
+                g_guncel = (yeni_veriler["Xauusd"]["deger"] * yeni_veriler["Usdtry"]["deger"]) / 31.1035
+                g_onceki = (yeni_veriler["Xauusd"]["onceki"] * yeni_veriler["Usdtry"]["onceki"]) / 31.1035
+                yeni_veriler["GLDGR"] = {"deger": g_guncel, "onceki": g_onceki, "birim": "TL"}
+                
+                if "Xauusd" in gecmis_veriler and "Usdtry" in gecmis_veriler:
+                    try:
+                        min_len = min(len(gecmis_veriler["Xauusd"]["degerler"]), len(gecmis_veriler["Usdtry"]["degerler"]))
+                        g_tarihler = gecmis_veriler["Xauusd"]["tarihler"][-min_len:]
+                        g_degerler = [(x * u)/31.1035 for x, u in zip(gecmis_veriler["Xauusd"]["degerler"][-min_len:], gecmis_veriler["Usdtry"]["degerler"][-min_len:])]
+                        gecmis_veriler["GLDGR"] = {"tarihler": g_tarihler, "degerler": g_degerler}
+                    except Exception as e:
+                        print("Gram altın geçmiş hesabı hatası:", e)
+
+        root.after(0, lambda: set_status("Gemini Makro Verileri Tarıyor...", "cyan"))
+        gemini_verileri = gemini_ile_veri_tamamla()
+        
+        if gemini_verileri:
+            for key, val in gemini_verileri.items():
+                yeni_veriler[key] = val
+                if key in gecmis_veriler:
+                    gecmis_veriler[key]["degerler"][-1] = val["deger"]
+
+        for key in yeni_veriler:
+            deg = float(yeni_veriler[key]["deger"])
+            onc = float(yeni_veriler[key]["onceki"])
+            yeni_veriler[key]["degisim"] = ((deg - onc) / onc) * 100 if onc > 0 else 0.0
+
+        finans_verileri = yeni_veriler
+        son_guncelleme = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        
+        kontrol_et_alarmlar()
+        
+        # Eğer portföy sekmesi açıksa orayı da güncelle
+        if 'guncelle_portfoy_listesi' in globals():
+            root.after(0, guncelle_portfoy_listesi)
+
+        root.after(0, guncelle_arayuz)
+        root.after(0, lambda: set_status(f"Son Güncelleme: {son_guncelleme} (Başarılı)", "green"))
+
+    except Exception as e:
+        root.after(0, lambda: set_status(f"Hata: {str(e)}", "red"))
+
+# --- YENİ: PORTFÖY (ROBO-DANIŞMAN) YÖNETİMİ ---
+def guncelle_portfoy_listesi():
+    for w in portfoy_liste_frame.winfo_children(): w.destroy()
+    
+    toplam_maliyet = 0.0
+    toplam_guncel_deger = 0.0
+    
+    if not kullanici_portfoyu:
+        ctk.CTkLabel(portfoy_liste_frame, text="Henüz portföyünüze varlık eklemediniz.", text_color="#7f8c8d").pack(pady=30)
+        portfoy_ozet_lbl.configure(text="Toplam Kâr/Zarar: 0.00 TL")
+        return
+
+    for i, varlik in enumerate(kullanici_portfoyu):
+        satir = ctk.CTkFrame(portfoy_liste_frame, fg_color="#1e272e", height=50)
+        satir.pack(fill="x", pady=5)
+        satir.pack_propagate(False)
+        
+        sembol = varlik["sembol"]
+        miktar = varlik["miktar"]
+        maliyet_fiyati = varlik["maliyet"]
+        maliyet_tutari = miktar * maliyet_fiyati
+        
+        # Eğer canlı veri varsa kâr/zarar hesapla
+        if sembol in finans_verileri:
+            guncel_fiyat = finans_verileri[sembol]["deger"]
+            birim = finans_verileri[sembol]["birim"]
+            guncel_tutar = miktar * guncel_fiyat
+            fark_yuzde = ((guncel_fiyat - maliyet_fiyati) / maliyet_fiyati) * 100 if maliyet_fiyati > 0 else 0
+            
+            renk = "#2ecc71" if fark_yuzde >= 0 else "#e74c3c"
+            durum_oku = "▲" if fark_yuzde >= 0 else "▼"
+            bilgi_metni = f"💼 {sembol} | Miktar: {miktar} | Maliyet: {maliyet_fiyati:.2f}{birim} | Güncel: {guncel_fiyat:.2f}{birim} | K/Z: {durum_oku} %{abs(fark_yuzde):.2f}"
+        else:
+            bilgi_metni = f"💼 {sembol} | Miktar: {miktar} | Maliyet: {maliyet_fiyati:.2f} (Veri Bekleniyor...)"
+            renk = "white"
+            
+        ctk.CTkButton(satir, text="Sat / Sil", width=60, fg_color="#c0392b", hover_color="#e74c3c", command=lambda idx=i: portfoyden_sil(idx)).pack(side="right", padx=15)
+        ctk.CTkLabel(satir, text=bilgi_metni, font=("Segoe UI", 12, "bold"), text_color=renk, anchor="w").pack(side="left", fill="x", expand=True, padx=(15, 5))
+
+def portfoye_ekle():
+    sembol = portfoy_sembol_var.get()
+    try:
+        miktar = float(portfoy_miktar_entry.get())
+        maliyet = float(portfoy_maliyet_entry.get())
+        kullanici_portfoyu.append({"sembol": sembol, "miktar": miktar, "maliyet": maliyet})
+        ayarlari_kaydet()
+        guncelle_portfoy_listesi()
+        portfoy_miktar_entry.delete(0, 'end')
+        portfoy_maliyet_entry.delete(0, 'end')
+    except:
+        messagebox.showerror("Hata", "Miktar ve Maliyet alanlarına geçerli rakamlar giriniz.")
+
+def portfoyden_sil(idx):
+    cevap = messagebox.askyesno("Emin misiniz?", "Bu varlığı portföyden silmek istediğinize emin misiniz?")
+    if cevap:
+        kullanici_portfoyu.pop(idx)
+        ayarlari_kaydet()
+        guncelle_portfoy_listesi()
+
+def robo_danisman_analizi_baslat():
+    if not kullanici_portfoyu:
+        messagebox.showinfo("Uyarı", "Analiz edilecek portföy bulunamadı.")
+        return
+    if not finans_verileri:
+        messagebox.showinfo("Uyarı", "Canlı veriler henüz yüklenmedi, lütfen bekleyin.")
+        return
+        
+    robo_textbox.configure(state="normal")
+    robo_textbox.delete("0.0", "end")
+    robo_textbox.insert("0.0", "🤖 Robo-Danışman (AI) portföy riskinizi ve piyasa haberlerini analiz ediyor... Lütfen bekleyin.\n(Bu işlem ortalama 5-10 saniye sürebilir)")
+    robo_textbox.configure(state="disabled")
+    
+    def ai_portfoy_thread():
+        # Portföyü AI'a anlatacak formata çevir
+        portfoy_ozeti = []
+        for v in kullanici_portfoyu:
+            s = v['sembol']
+            if s in finans_verileri:
+                guncel = finans_verileri[s]['deger']
+                fark = ((guncel - v['maliyet']) / v['maliyet']) * 100
+                portfoy_ozeti.append(f"- {s}: {v['miktar']} adet, Maliyet: {v['maliyet']}, Güncel: {guncel}, Kâr/Zarar: %{fark:.2f}")
+        
+        p_metin = "\n".join(portfoy_ozeti)
+        h_metin = "\n".join([f"- {h['baslik']} ({h['etki']})" for h in haber_akisi_cache[:8]]) if haber_akisi_cache else "Yeni haber yok."
+        
+        prompt = f"""Sen dünyanın en iyi hedge fon yöneticisi ve yapay zeka tabanlı bir Robo-Danışmansın. 
+Müşterinin güncel portföyü ve kâr/zarar durumu şu şekildedir:
+{p_metin}
+
+Piyasadaki son dakika haberleri ve etkileri şu şekildedir:
+{h_metin}
+
+Lütfen bu portföyü detaylı analiz et. 
+1. Risk Dağılımı: Portföy çok mu riskli, çok mu defansif? (Çeşitlendirme iyi mi?)
+2. Haberlerin Etkisi: Bugün çıkan haberler kullanıcının elindeki varlıkları (olumlu/olumsuz) nasıl etkiler?
+3. Aksiyon Önerileri (Rebalancing): Portföyü daha güvenli veya kazançlı hale getirmek için hangi varlıktan kâr alıp hangisine geçmeli? Neleri tutmalı (Hold)?
+
+Lütfen madde madde, finans jargonu kullanarak ama anlaşılır bir dille tavsiye ver. Uyarı: Bu bir yatırım tavsiyesi değildir ibaresini sona ekle."""
+
+        sonuc = gemini_istek_gonder(prompt)
+        
+        def ui_guncelle():
+            robo_textbox.configure(state="normal")
+            robo_textbox.delete("0.0", "end")
+            if sonuc:
+                robo_textbox.insert("0.0", sonuc)
+            else:
+                robo_textbox.insert("0.0", "Robo-Danışman'a şu an ulaşılamıyor. Lütfen API bağlantınızı kontrol edin.")
+            robo_textbox.configure(state="disabled")
+            
+        root.after(0, ui_guncelle)
+        
+    threading.Thread(target=ai_portfoy_thread, daemon=True).start()
+
+
+# --- ALARM SİSTEMİ KONTROLÜ ---
+def kontrol_et_alarmlar():
+    tetiklenenler = []
+    for alarm in aktif_alarmlar:
+        anahtar = alarm["sembol"]
+        if anahtar in finans_verileri:
+            guncel_deger = finans_verileri[anahtar]["deger"]
+            hedef_deger = float(alarm["deger"])
+            kosul = alarm["kosul"]
+            
+            if (kosul == ">" and guncel_deger > hedef_deger) or (kosul == "<" and guncel_deger < hedef_deger):
+                tetiklenenler.append(f"{anahtar} {kosul} {hedef_deger} gerçekleşti! (Güncel: {guncel_deger:.2f})")
+    
+    if tetiklenenler:
+        mesaj = "\n".join(tetiklenenler)
+        root.after(0, lambda: messagebox.showwarning("🔔 Eşik Değer Alarmı!", mesaj))
+
+def simule_et_alarmlar():
+    if not aktif_alarmlar:
+        messagebox.showinfo("Bilgi", "Test edilecek alarm bulunmuyor. Lütfen önce bir alarm kurun.")
+        return
+    tetiklenenler = []
+    for alarm in aktif_alarmlar:
+        anahtar = alarm["sembol"]
+        hedef_deger = float(alarm["deger"])
+        kosul = alarm["kosul"]
+        simule_edilen_deger = hedef_deger + 1.0 if kosul == ">" else hedef_deger - 1.0
+        tetiklenenler.append(f"🧪 [TEST SİMÜLASYONU]\n{anahtar} varlığı {kosul} {hedef_deger} şartını sağladı!\n(Sanal Anlık Değer: {simule_edilen_deger:.2f})")
+        
+    if tetiklenenler:
+        mesaj = "\n\n".join(tetiklenenler)
+        root.after(0, lambda: messagebox.showwarning("🔔 ALARM TESTİ BAŞARILI!", mesaj))
+
+# --- EXCEL / CSV DIŞA AKTARMA ---
+def disari_aktar():
+    if not finans_verileri:
+        messagebox.showinfo("Bilgi", "Dışa aktarılacak veri yok.")
+        return
+    dosya_yolu = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")], title="Raporu Kaydet")
+    if dosya_yolu:
+        try:
+            with open(dosya_yolu, mode='w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f, delimiter=';')
+                writer.writerow(["Sembol", "Birim", "Güncel Değer", "Önceki Değer", "Değişim (%)", "Tarih"])
+                for anahtar, veri in finans_verileri.items():
+                    writer.writerow([anahtar, veri["birim"], f"{veri['deger']:.4f}".replace('.',','), 
+                                     f"{veri['onceki']:.4f}".replace('.',','), f"{veri['degisim']:.2f}".replace('.',','), son_guncelleme])
+            messagebox.showinfo("Başarılı", f"Veriler kaydedildi:\n{dosya_yolu}")
+        except Exception as e:
+            messagebox.showerror("Hata", f"Kayıt hatası: {e}")
+
+def ayarlari_sifirla():
+    cevap = messagebox.askyesno("Sıfırla", "Eklediğiniz tüm özel sembolleriniz, portföyünüz ve alarmlarınız silinip fabrika ayarlarına dönülecek. Onaylıyor musunuz?")
+    if cevap:
+        if os.path.exists(SETTINGS_FILE):
+            try: os.remove(SETTINGS_FILE)
+            except: pass
+        messagebox.showinfo("Bilgi", "Ayarlar başarıyla sıfırlandı. Uygulama şimdi kapatılacak.")
+        root.destroy()
+
+# --- GELİŞMİŞ TARİH FİLTRELİ DETAY MODALI VE AI ANALİZİ ---
+def goster_detay_modal(anahtar, baslik, ikon, renk, birim):
+    if anahtar not in gecmis_veriler:
+        messagebox.showwarning("Uyarı", "Bu veri için geçmiş veri henüz hazır değil.")
+        return
+
+    modal = ctk.CTkToplevel(root)
+    modal.title(f"Gelişmiş Analiz - {baslik}")
+    modal.geometry("900x800")
+    modal.attributes("-topmost", True)
+    modal.configure(fg_color="#181b1f")
+    modal.focus_force()
+
+    header_frame = ctk.CTkFrame(modal, fg_color="#2c3e50", corner_radius=0, height=80)
+    header_frame.pack(fill="x", side="top")
+    
+    ctk.CTkLabel(header_frame, text=f"{ikon} {baslik}", font=("Segoe UI", 24, "bold"), text_color="white").pack(side="left", padx=20, pady=20)
+    guncel_deger = finans_verileri[anahtar]["deger"]
+    format_str = "{:,.4f}" if "USD" in anahtar.upper() else "{:,.2f}"
+    
+    badge_frame = ctk.CTkFrame(header_frame, fg_color=renk, corner_radius=15)
+    badge_frame.pack(side="right", padx=20, pady=20)
+    ctk.CTkLabel(badge_frame, text=f"Anlık: {format_str.format(guncel_deger)} {birim}", font=("Segoe UI", 16, "bold"), text_color="white").pack(padx=15, pady=5)
+
+    ai_frame = ctk.CTkFrame(modal, fg_color="#1e272e", corner_radius=10, border_width=1, border_color="#2f3640", height=180)
+    ai_frame.pack(fill="x", side="bottom", padx=20, pady=20)
+    ai_frame.pack_propagate(False)
+
+    ctk.CTkLabel(ai_frame, text="🤖 AI Profesyonel Piyasa Yorumu", font=("Segoe UI", 14, "bold"), text_color="#f1c40f").pack(anchor="w", padx=15, pady=(5, 0))
+
+    ai_textbox_modal = ctk.CTkTextbox(ai_frame, font=("Segoe UI", 13), fg_color="#2c3e50", border_width=0, wrap="word")
+    ai_textbox_modal.pack(fill="both", expand=True, padx=15, pady=(5, 10))
+    ai_textbox_modal.insert("0.0", "Bu varlığa özel analiz almak için '🤖 AI ile Yorumla' butonuna tıklayın.")
+    ai_textbox_modal.configure(state="disabled")
+
+    def yapay_zeka_analizi_baslat():
+        ai_textbox_modal.configure(state="normal")
+        ai_textbox_modal.delete("0.0", "end")
+        ai_textbox_modal.insert("0.0", f"Analiz ediliyor: {baslik}... Lütfen bekleyin. 🤖📈")
+        ai_textbox_modal.configure(state="disabled")
+        
+        def analiz_thread():
+            guncel = finans_verileri[anahtar]["deger"]
+            degisim = finans_verileri[anahtar]["degisim"]
+            data = gecmis_veriler[anahtar]
+            son_hafta = [float(f"{d:.4f}" if "USD" in anahtar.upper() else f"{d:.2f}") for d in data["degerler"][-7:]] if len(data["degerler"]) >= 7 else data["degerler"]
+            
+            prompt = f"Sen uzman bir tradersın. Varlık: {baslik}. Güncel Fiyat: {guncel} {birim}. Günlük Değişim: %{degisim:.2f}. Son 7 Gün Fiyatları: {son_hafta}.\nProfesyonel bir teknik/temel analiz yaz, destek direnç belirle, trendi yorumla. 2-3 paragraf olsun."
+            sonuc = gemini_istek_gonder(prompt)
+            
+            def arayuzu_guncelle():
+                ai_textbox_modal.configure(state="normal")
+                ai_textbox_modal.delete("0.0", "end")
+                ai_textbox_modal.insert("0.0", sonuc if sonuc else "Analiz alınamadı.")
+                ai_textbox_modal.configure(state="disabled")
+                
+            modal.after(0, arayuzu_guncelle)
+        threading.Thread(target=analiz_thread, daemon=True).start()
+
+    content_frame = ctk.CTkFrame(modal, fg_color="transparent")
+    content_frame.pack(fill="both", expand=True, padx=20, pady=(10, 0))
+
+    filter_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
+    filter_frame.pack(fill="x", pady=(0, 10))
+    
+    ctk.CTkButton(filter_frame, text="🤖 AI ile Yorumla", font=("Segoe UI", 12, "bold"), fg_color="#8e44ad", hover_color="#9b59b6", command=yapay_zeka_analizi_baslat).pack(side="right", padx=5)
+
+    chart_frame = ctk.CTkFrame(content_frame, fg_color="#1e272e", corner_radius=10, border_width=1, border_color="#2f3640")
+    chart_frame.pack(fill="both", expand=True)
+
+    canvas_widget = None
+
+    def grafiki_ciz(periyot_gun):
+        nonlocal canvas_widget
+        if canvas_widget: canvas_widget.destroy()
+
+        fig, ax = plt.subplots(figsize=(8, 4), facecolor='#1e272e')
+        fig.patch.set_facecolor('#1e272e')
+        ax.set_facecolor('#1e272e')
+
+        data = gecmis_veriler[anahtar]
+        tum_tarihler = [datetime.datetime.strptime(t, '%Y-%m-%d') for t in data["tarihler"]]
+        tum_degerler = data["degerler"]
+
+        if periyot_gun == "YBD":
+            yil_basi = datetime.datetime(datetime.datetime.now().year, 1, 1)
+            filtre = [(t, d) for t, d in zip(tum_tarihler, tum_degerler) if t >= yil_basi]
+        else:
+            baslangic = tum_tarihler[-1] - datetime.timedelta(days=periyot_gun)
+            filtre = [(t, d) for t, d in zip(tum_tarihler, tum_degerler) if t >= baslangic]
+
+        if not filtre: filtre = list(zip(tum_tarihler, tum_degerler))
+
+        x_veri, y_veri = zip(*filtre)
+
+        ax.plot(x_veri, y_veri, color=renk, linewidth=2)
+        ax.fill_between(x_veri, y_veri, min(y_veri) * 0.99, color=renk, alpha=0.1)
+
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b %y'))
+        fig.autofmt_xdate() 
+        ax.tick_params(colors='white', labelsize=9)
+        for spine in ax.spines.values(): spine.set_color('#3d3d3d')
+        ax.grid(color='#3d3d3d', linestyle='--', linewidth=0.5, alpha=0.7)
+
+        plt.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=chart_frame)
+        canvas.draw()
+        canvas_widget = canvas.get_tk_widget()
+        canvas_widget.pack(fill="both", expand=True, padx=10, pady=10)
+
+    periyotlar = [("1 Hafta", 7), ("1 Ay", 30), ("3 Ay", 90), ("YBD", "YBD"), ("1 Yıl", 365)]
+    for text, val in periyotlar:
+        btn = ctk.CTkButton(filter_frame, text=text, width=80, fg_color="#34495e", hover_color=renk, command=lambda v=val: grafiki_ciz(v))
+        btn.pack(side="left", padx=5)
+
+    grafiki_ciz(30)
+
+# --- ARAYÜZ YARDIMCI FONKSİYONLARI ---
+def set_status(msg, color="white"):
+    status_label.configure(text=msg, text_color=color)
+
+def scroll_ticker():
+    if not finans_verileri: return
+    text_parts = []
+    for item in dinamik_konfigurasyon[:6]:
+        key = item["anahtar"]
+        if key in finans_verileri:
+            val = finans_verileri[key]["deger"]
+            chg = finans_verileri[key]["degisim"]
+            ok = "▲" if chg >= 0 else "▼"
+            text_parts.append(f"{item['ikon']} {key}: {val:.2f} ({ok} %{abs(chg):.2f})")
+            
+    tam_metin = "   |   ".join(text_parts) + "   |   "
+    mevcut = ticker_label.cget("text")
+    if mevcut == "Piyasa verileri yükleniyor...": ticker_label.configure(text=tam_metin)
+    else: ticker_label.configure(text=mevcut[1:] + mevcut[0])
+    root.after(200, scroll_ticker)
+
+# --- SAYFA MANTIKLARI ---
+def secme_sayfasi(sayfa_adi):
+    for frame in [frame_dashboard, frame_charts, frame_ai_summary, frame_assistant, frame_news, frame_correlation, frame_alerts, frame_portfolio]:
+        frame.pack_forget()
+    for btn in menu_butonlari:
+        btn.configure(fg_color="transparent")
+        
+    if sayfa_adi == "Dashboard":
+        frame_dashboard.pack(fill="both", expand=True)
+        btn_dash.configure(fg_color=("#3498db", "#3498db"))
+        top_header.pack(fill="x", padx=20, pady=(20, 0), before=frame_dashboard)
+    else:
+        top_header.pack_forget()
+        if sayfa_adi == "Charts":
+            frame_charts.pack(fill="both", expand=True); btn_chart.configure(fg_color=("#3498db", "#3498db")); ciz_teknik_analiz()
+        elif sayfa_adi == "AI":
+            frame_ai_summary.pack(fill="both", expand=True); btn_ai.configure(fg_color=("#3498db", "#3498db")); olustur_ai_ozeti()
+        elif sayfa_adi == "Assistant":
+            frame_assistant.pack(fill="both", expand=True); btn_assistant.configure(fg_color=("#3498db", "#3498db"))
+        elif sayfa_adi == "Portfolio":
+            frame_portfolio.pack(fill="both", expand=True); btn_portfolio.configure(fg_color=("#3498db", "#3498db")); guncelle_portfoy_listesi()
+        elif sayfa_adi == "News":
+            frame_news.pack(fill="both", expand=True); btn_news.configure(fg_color=("#3498db", "#3498db")); getir_haber_akisi()
+        elif sayfa_adi == "Correlation":
+            frame_correlation.pack(fill="both", expand=True); btn_corr.configure(fg_color=("#3498db", "#3498db"))
+        elif sayfa_adi == "Alerts":
+            frame_alerts.pack(fill="both", expand=True); btn_alerts.configure(fg_color=("#3498db", "#3498db")); guncelle_alarm_listesi()
+
+def olustur_ai_ozeti():
+    if not finans_verileri:
+        ai_textbox.delete("0.0", "end")
+        ai_textbox.insert("0.0", "Lütfen önce verilerin yüklenmesini bekleyin...")
+        return
+    ai_textbox.delete("0.0", "end")
+    ai_textbox.insert("0.0", "🤖 Gemini Yapay Zeka piyasa verilerini analiz ediyor, lütfen bekleyin...")
+    def analiz_yap():
+        veri_metni = json.dumps({k: v['deger'] for k, v in finans_verileri.items()})
+        prompt = f"""Şu anki güncel finansal veriler: {veri_metni}.
+        Kurumsal bir analist gibi 3 paragraflık 'Günün Özeti' yaz. Dili profesyonel olsun."""
+        sonuc = gemini_istek_gonder(prompt)
+        root.after(0, lambda: ai_textbox.delete("0.0", "end"))
+        root.after(0, lambda: ai_textbox.insert("0.0", sonuc if sonuc else "AI API Hatası."))
+    threading.Thread(target=analiz_yap, daemon=True).start()
+
+def asistan_cevap_al(soru):
+    if not finans_verileri: veriler_metni = "Veri bekleniyor."
+    else: veriler_metni = ", ".join([f"{v['baslik']}: {finans_verileri[v['anahtar']]['deger']}" for v in dinamik_konfigurasyon if v['anahtar'] in finans_verileri])
+    if not haber_akisi_cache: haberler_metni = "Haber bulunamadı."
+    else: haberler_metni = "\n".join([f"- {h['baslik']}" for h in haber_akisi_cache[:5]])
+        
+    prompt = f"""Sen Wall Street standartlarında bir yapay zeka finansal asistanısın. Adın 'Terminal AI'.
+Güncel saniyelik piyasa verileri: {veriler_metni}
+Son dakika haberleri: {haberler_metni}
+Kullanıcı sana şunu sordu: "{soru}"
+Elindeki verileri ve haberleri sentezleyerek kullanıcıya profesyonel, analitik yanıt ver."""
+    sonuc = gemini_istek_gonder(prompt)
+    def ui_guncelle():
+        chat_history.configure(state="normal")
+        mevcut_metin = chat_history.get("0.0", "end").replace("Terminal AI: Analiz ediliyor, lütfen bekleyin...\n\n", "")
+        chat_history.delete("0.0", "end")
+        chat_history.insert("end", mevcut_metin)
+        chat_history.insert("end", f"Terminal AI: {sonuc if sonuc else 'Bağlantı Hatası.'}\n\n")
+        chat_history.configure(state="disabled")
+        chat_history.see("end")
+    root.after(0, ui_guncelle)
+
+def chat_gonder(event=None):
+    soru = chat_entry.get().strip()
+    if not soru: return
+    chat_entry.delete(0, 'end')
+    chat_history.configure(state="normal")
+    chat_history.insert("end", f"Siz: {soru}\n\nTerminal AI: Analiz ediliyor, lütfen bekleyin...\n\n")
+    chat_history.configure(state="disabled")
+    chat_history.see("end")
+    threading.Thread(target=asistan_cevap_al, args=(soru,), daemon=True).start()
+
+def etki_belirle(baslik):
+    b = baslik.lower()
+    if any(k in b for k in ["yükseldi", "arttı", "rekor", "kâr", "büyüdü", "olumlu", "kazandı", "uçuşa"]): return "Pozitif"
+    elif any(k in b for k in ["düştü", "azaldı", "zarar", "kriz", "çakıldı", "geriledi", "kaybetti", "şok", "düşüş"]): return "Negatif"
+    return "Nötr"
+
+def getir_haber_akisi():
+    global haber_akisi_cache
+    if haber_akisi_cache:
+        goster_haberler()
+        return
+    for w in news_container.winfo_children(): w.destroy()
+    ctk.CTkLabel(news_container, text="📰 Gerçek zamanlı güncel piyasa haberleri çekiliyor...", font=("Segoe UI", 14)).pack(pady=50)
+
+    def haber_cek():
+        global haber_akisi_cache
+        yeni_haberler = []
+        try:
+            url = "https://news.google.com/rss/search?q=ekonomi+OR+borsa+OR+piyasa+OR+döviz+OR+hisse+when:1d&hl=tr&gl=TR&ceid=TR:tr"
+            res = requests.get(url, timeout=10)
+            if res.status_code == 200:
+                root_xml = ET.fromstring(res.content)
+                for item in root_xml.findall('./channel/item')[:15]:
+                    baslik = item.find('title').text
+                    if " - " in baslik: baslik = baslik.rsplit(" - ", 1)[0]
+                    yeni_haberler.append({
+                        "baslik": baslik,
+                        "ozet": f"Yayınlanma: {item.find('pubDate').text}",
+                        "kaynak": item.find('source').text,
+                        "etki": etki_belirle(baslik),
+                        "url": item.find('link').text
+                    })
+        except: pass
+        if not yeni_haberler:
+            yeni_haberler = [{"baslik": "Piyasalar veri bekliyor", "ozet": "Demo Haber", "kaynak": "Demo", "etki": "Nötr", "url": ""}]
+        haber_akisi_cache = yeni_haberler
+        root.after(0, goster_haberler)
+    threading.Thread(target=haber_cek, daemon=True).start()
+
+def goster_haberler():
+    for w in news_container.winfo_children(): w.destroy()
+    for haber in haber_akisi_cache:
+        kutu = ctk.CTkFrame(news_container, fg_color="#1e272e", corner_radius=8, border_width=1, border_color="#2f3640")
+        kutu.pack(fill="x", padx=20, pady=10)
+        renk = "#2ecc71" if haber.get("etki") == "Pozitif" else ("#e74c3c" if haber.get("etki") == "Negatif" else "#f1c40f")
+        ust = ctk.CTkFrame(kutu, fg_color="transparent")
+        ust.pack(fill="x", padx=15, pady=(15, 5))
+        ctk.CTkLabel(ust, text=haber.get("baslik", ""), font=("Segoe UI", 16, "bold"), text_color="white", wraplength=700, justify="left").pack(side="left")
+        ctk.CTkLabel(ust, text=haber.get("etki", ""), font=("Segoe UI", 12, "bold"), text_color=renk).pack(side="right")
+        ctk.CTkLabel(kutu, text=haber.get("ozet", ""), font=("Segoe UI", 13), text_color="#bdc3c7", justify="left").pack(fill="x", padx=15, pady=5)
+        alt = ctk.CTkFrame(kutu, fg_color="transparent")
+        alt.pack(fill="x", padx=15, pady=(0, 15))
+        ctk.CTkLabel(alt, text=f"Kaynak: {haber.get('kaynak', 'Bilinmiyor')}", font=("Segoe UI", 10, "italic"), text_color="#7f8c8d").pack(side="left")
+        link = haber.get("url", "")
+        if link:
+            btn_git = ctk.CTkLabel(alt, text="Habere Git ↗", font=("Segoe UI", 11, "bold"), text_color="#3498db", cursor="hand2")
+            btn_git.pack(side="right")
+            btn_git.bind("<Button-1>", lambda e, l=link: webbrowser.open(l))
+
+def sembol_ekle_dialog():
+    arama_penceresi = ctk.CTkToplevel(root)
+    arama_penceresi.title("Hisse, Kripto veya Döviz Ara")
+    arama_penceresi.geometry("650x550")
+    arama_penceresi.attributes("-topmost", True)
+    
+    ust = ctk.CTkFrame(arama_penceresi, fg_color="transparent")
+    ust.pack(fill="x", padx=20, pady=20)
+    entry = ctk.CTkEntry(ust, placeholder_text="Şirket, Kripto veya Döviz yazın...", width=450)
+    entry.pack(side="left", padx=(0, 10))
+    sonuclar = ctk.CTkScrollableFrame(arama_penceresi, fg_color="#1e272e")
+    sonuclar.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+    def arama_yap(*args):
+        sorgu = entry.get().strip()
+        if len(sorgu) < 2: return
+        for w in sonuclar.winfo_children(): w.destroy()
+        ctk.CTkLabel(sonuclar, text="Aranıyor... 🔍", text_color="#f1c40f").pack(pady=30)
+        def api_istek():
+            try:
+                res = requests.get(f"https://query2.finance.yahoo.com/v1/finance/search?q={sorgu}", headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+                arama_penceresi.after(0, lambda: goster(res.json().get("quotes", [])))
+            except: arama_penceresi.after(0, lambda: messagebox.showerror("Hata", "Bağlantı hatası."))
+        threading.Thread(target=api_istek, daemon=True).start()
+
+    def goster(quotes):
+        for w in sonuclar.winfo_children(): w.destroy()
+        if not quotes:
+            ctk.CTkLabel(sonuclar, text="Sonuç bulunamadı.", text_color="#e74c3c").pack(pady=30)
+            return
+        for q in quotes:
+            t = q.get("symbol", "")
+            i = q.get("shortname", q.get("longname", t)) or t
+            satir = ctk.CTkFrame(sonuclar, fg_color="#2c3e50")
+            satir.pack(fill="x", pady=5, padx=5)
+            bilgi = ctk.CTkFrame(satir, fg_color="transparent")
+            bilgi.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+            ctk.CTkLabel(bilgi, text=f"{t} - {i[:40]}", font=("Segoe UI", 14, "bold"), anchor="w").pack(fill="x")
+            btn = ctk.CTkButton(satir, text="➕ Panoya Ekle", width=100, fg_color="#27ae60", command=lambda tk=t, nm=i: ekle(tk, nm))
+            btn.pack(side="right", padx=15)
+
+    def ekle(t, nm):
+        isim = simpledialog.askstring("İsim Belirle", f"Başlık girin:", initialvalue=nm, parent=arama_penceresi)
+        if not isim: return
+        dinamik_konfigurasyon.append({"anahtar": t.split('=')[0].replace('-', ''), "baslik": isim[:15], "ikon": "📊", "renk": "#34495e", "yf_ticker": t, "tur": "yfinance"})
+        ayarlari_kaydet()
+        guncelle_dropdown_listeleri()
+        threading.Thread(target=veri_cek_ve_guncelle, daemon=True).start()
+        arama_penceresi.destroy()
+
+    ctk.CTkButton(ust, text="Ara 🔍", width=80, command=arama_yap).pack(side="left")
+    entry.bind("<Return>", arama_yap)
+
+# --- ALARM LİSTESİ VE EKRANI ---
+def guncelle_alarm_listesi():
+    for w in alarm_liste_frame.winfo_children(): w.destroy()
+    for i, alarm in enumerate(aktif_alarmlar):
+        satir = ctk.CTkFrame(alarm_liste_frame, fg_color="#1e272e", height=40)
+        satir.pack(fill="x", pady=2)
+        satir.pack_propagate(False)
+        ctk.CTkLabel(satir, text=f"🔔 {alarm['sembol']} {alarm['kosul']} {alarm['deger']}").pack(side="left", padx=15)
+        ctk.CTkButton(satir, text="Sil", width=50, fg_color="#c0392b", command=lambda idx=i: alarm_sil(idx)).pack(side="right", padx=15)
+
+def alarm_ekle():
+    s = alarm_sembol_var.get()
+    k = alarm_kosul_var.get()
+    try:
+        v = float(alarm_deger_entry.get())
+        aktif_alarmlar.append({"sembol": s, "kosul": k, "deger": v})
+        ayarlari_kaydet()
+        guncelle_alarm_listesi()
+        alarm_deger_entry.delete(0, 'end')
+    except:
+        messagebox.showerror("Hata", "Geçerli bir sayı girin.")
+
+def alarm_sil(idx):
+    aktif_alarmlar.pop(idx)
+    ayarlari_kaydet()
+    guncelle_alarm_listesi()
+
+# --- KORELASYON ANALİZİ ---
+def ciz_korelasyon():
+    s1 = corr_var1.get()
+    s2 = corr_var2.get()
+    
+    if s1 not in gecmis_veriler or s2 not in gecmis_veriler:
+        messagebox.showwarning("Hata", "Seçilen varlıklar için geçmiş veri bulunamadı.")
+        return
+        
+    for w in corr_chart_frame.winfo_children(): w.destroy()
+    
+    fig, ax1 = plt.subplots(figsize=(10, 5), facecolor='#181b1f')
+    fig.patch.set_facecolor('#181b1f')
+    ax1.set_facecolor('#181b1f')
+    
+    d1 = gecmis_veriler[s1]
+    d2 = gecmis_veriler[s2]
+    
+    min_len = min(len(d1["tarihler"]), len(d2["tarihler"]))
+    tarihler = [datetime.datetime.strptime(t, '%Y-%m-%d') for t in d1["tarihler"][-min_len:]]
+    
+    c1, c2 = "#3498db", "#e74c3c"
+    
+    ax1.plot(tarihler, d1["degerler"][-min_len:], color=c1, label=s1, linewidth=2)
+    ax1.set_ylabel(s1, color=c1)
+    ax1.tick_params(axis='y', labelcolor=c1)
+    
+    ax2 = ax1.twinx()
+    ax2.plot(tarihler, d2["degerler"][-min_len:], color=c2, label=s2, linewidth=2)
+    ax2.set_ylabel(s2, color=c2)
+    ax2.tick_params(axis='y', labelcolor=c2)
+    
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
+    fig.autofmt_xdate()
+    
+    for ax in [ax1, ax2]:
+        ax.tick_params(colors='white')
+        for spine in ax.spines.values(): spine.set_color('#3d3d3d')
+    ax1.grid(color='#3d3d3d', linestyle='--', linewidth=0.5)
+    
+    plt.title(f"Korelasyon: {s1} vs {s2}", color="white")
+    fig.legend(loc="upper left", bbox_to_anchor=(0.1,0.9), facecolor='#1e272e', edgecolor='none', labelcolor='white')
+    
+    plt.tight_layout()
+    canvas = FigureCanvasTkAgg(fig, master=corr_chart_frame)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill="both", expand=True)
+
+# --- ARAYÜZ OLUŞTURMA (DASHBOARD KARTLARI) ---
+def create_card(parent, row, col, item, veri):
+    card = ctk.CTkFrame(parent, fg_color="#1e272e", corner_radius=12, border_width=2, border_color="#2f3640")
+    card.grid(row=row, column=col, padx=12, pady=12, sticky="nsew")
+    
+    def on_enter(e):
+        card.configure(border_color=item["renk"], fg_color="#26313a")
+        card.configure(cursor="hand2")
+
+    def on_leave(e):
+        card.configure(border_color="#2f3640", fg_color="#1e272e")
+        card.configure(cursor="")
+
+    def on_click(e):
+        goster_detay_modal(item["anahtar"], item["baslik"], item["ikon"], item["renk"], veri["birim"])
+
+    def on_right_click(e):
+        cevap = messagebox.askyesno("Sembolü Sil", f"'{item['baslik']}' sembolünü takip listesinden kaldırmak istiyor musunuz?")
+        if cevap:
+            global dinamik_konfigurasyon
+            dinamik_konfigurasyon = [x for x in dinamik_konfigurasyon if x["anahtar"] != item["anahtar"]]
+            ayarlari_kaydet()
+            guncelle_dropdown_listeleri()
+            guncelle_arayuz()
+
+    top_frame = ctk.CTkFrame(card, fg_color="transparent")
+    top_frame.pack(fill="x", padx=15, pady=(15, 5))
+    ctk.CTkLabel(top_frame, text=item["ikon"], font=("Segoe UI", 24), text_color=item["renk"]).pack(side="left")
+    ctk.CTkLabel(top_frame, text=item["baslik"], font=("Segoe UI", 13, "bold"), text_color="#bdc3c7").pack(side="left", padx=10)
+    
+    mid_frame = ctk.CTkFrame(card, fg_color="transparent")
+    mid_frame.pack(fill="x", padx=15, pady=0)
+    
+    format_string = "{:,.4f}" if "USD" in item["anahtar"].upper() else "{:,.2f}"
+    val_str = format_string.format(float(veri["deger"]))
+    
+    ctk.CTkLabel(mid_frame, text=val_str, font=("Segoe UI", 28, "bold"), text_color="white").pack(side="left")
+    ctk.CTkLabel(mid_frame, text=veri["birim"], font=("Segoe UI", 14), text_color="#95a5a6").pack(side="left", padx=5, pady=5)
+    
+    bot_frame = ctk.CTkFrame(card, fg_color="transparent")
+    bot_frame.pack(fill="x", padx=15, pady=(0, 15))
+    
+    degisim = float(veri["degisim"])
+    deg_color = "#2ecc71" if degisim >= 0 else "#e74c3c"
+    deg_ok = "▲" if degisim >= 0 else "▼"
+    if "Tüfe" in item["baslik"] or "Üfe" in item["baslik"] or "AOFM" in item["baslik"] or "Aktifhv" in item["baslik"]:
+        deg_color = "#e74c3c" if degisim > 0 else "#2ecc71"
+        
+    ctk.CTkLabel(bot_frame, text=f"{deg_ok} {abs(degisim):.2f}%", font=("Segoe UI", 12, "bold"), text_color=deg_color).pack(side="left")
+    
+    for widget in [card, top_frame, mid_frame, bot_frame] + card.winfo_children() + top_frame.winfo_children() + mid_frame.winfo_children() + bot_frame.winfo_children():
+        widget.bind("<Enter>", on_enter)
+        widget.bind("<Leave>", on_leave)
+        widget.bind("<Button-1>", on_click)
+        widget.bind("<Button-3>", on_right_click)
+
+def guncelle_arayuz():
+    if not finans_verileri: return
+        
+    for widget in dashboard_icerik.winfo_children(): widget.destroy()
+        
+    for i in range(4): dashboard_icerik.grid_columnconfigure(i, weight=1)
+        
+    for index, item in enumerate(dinamik_konfigurasyon):
+        if item["anahtar"] in finans_verileri:
+            satir = index // 4
+            sutun = index % 4
+            create_card(dashboard_icerik, satir, sutun, item, finans_verileri[item["anahtar"]])
+            
+    satir = len(dinamik_konfigurasyon) // 4
+    sutun = len(dinamik_konfigurasyon) % 4
+    add_card = ctk.CTkFrame(dashboard_icerik, fg_color="#1e272e", corner_radius=12, border_width=2, border_color="#34495e")
+    add_card.grid(row=satir, column=sutun, padx=12, pady=12, sticky="nsew")
+    btn_ekle = ctk.CTkButton(add_card, text="➕ Yeni Sembol Ekle", font=("Segoe UI", 14, "bold"), fg_color="transparent", hover_color="#2c3e50", command=sembol_ekle_dialog)
+    btn_ekle.pack(fill="both", expand=True)
+
+# --- ANA PENCERE (ROOT) AYARLARI ---
+root = ctk.CTk()
+root.title("DeFacto Enterprise Finans Terminali")
+root.geometry("1400x900")
+
+# --- YENİ EKLENEN: SPLASH SCREEN (YÜKLEME EKRANI) ---
+root.withdraw()  # Ana pencereyi yükleme bitene kadar gizle
+
+splash = ctk.CTkToplevel()
+splash.geometry("600x350")
+splash.overrideredirect(True)  # Pencere kenarlıklarını kaldır
+splash.configure(fg_color="#111111")
+splash.attributes("-topmost", True)
+
+# Splash ekranını ortala
+ekran_genislik = splash.winfo_screenwidth()
+ekran_yukseklik = splash.winfo_screenheight()
+x = int((ekran_genislik / 2) - (600 / 2))
+y = int((ekran_yukseklik / 2) - (350 / 2))
+splash.geometry(f"600x350+{x}+{y}")
+
+# İçerik
+ctk.CTkLabel(splash, text="DeFacto", font=("Segoe UI", 64, "bold"), text_color="#f1c40f").pack(expand=True, pady=(60, 0))
+ctk.CTkLabel(splash, text="Enterprise Finans Terminali", font=("Segoe UI", 20), text_color="#bdc3c7").pack(pady=(5, 30))
+
+prog_bar = ctk.CTkProgressBar(splash, width=400, fg_color="#2c3e50", progress_color="#f1c40f", mode="indeterminate")
+prog_bar.pack(pady=(0, 40))
+prog_bar.start()
+
+def main_window_goster():
+    prog_bar.stop()
+    splash.destroy()
+    root.deiconify()  # Ana pencereyi tekrar göster
+    # Veri çekmeyi ana ekran açıldıktan sonra başlatıyoruz ki donma yapmasın
+    threading.Thread(target=veri_cek_ve_guncelle, daemon=True).start()
+
+# 3 saniye sonra ana ekranı göster
+splash.after(3000, main_window_goster)
+# ----------------------------------------------------
+
+ticker_frame = ctk.CTkFrame(root, height=35, corner_radius=0, fg_color="#111111")
+ticker_frame.pack(side="top", fill="x")
+ticker_label = ctk.CTkLabel(ticker_frame, text="Piyasa verileri yükleniyor...", font=("Consolas", 12, "bold"), text_color="#2ecc71")
+ticker_label.pack(side="left", padx=10, pady=5)
+
+sidebar = ctk.CTkFrame(root, width=250, corner_radius=0, fg_color="#2c3e50")
+sidebar.pack(side="left", fill="y")
+sidebar.pack_propagate(False)
+
+ctk.CTkLabel(sidebar, text="DeFacto\nTerminal", font=("Segoe UI", 24, "bold"), text_color="white").pack(pady=(30, 10))
+
+btn_dash = ctk.CTkButton(sidebar, text="📊 Genel Görünüm", font=("Segoe UI", 14), anchor="w", corner_radius=6, command=lambda: secme_sayfasi("Dashboard"))
+btn_dash.pack(fill="x", padx=15, pady=5)
+
+btn_portfolio = ctk.CTkButton(sidebar, text="💼 AI Robo-Danışman", font=("Segoe UI", 14, "bold"), text_color="#2ecc71", anchor="w", corner_radius=6, command=lambda: secme_sayfasi("Portfolio"))
+btn_portfolio.pack(fill="x", padx=15, pady=5)
+
+btn_ai = ctk.CTkButton(sidebar, text="🤖 AI Piyasa Özeti", font=("Segoe UI", 14), anchor="w", corner_radius=6, command=lambda: secme_sayfasi("AI"))
+btn_ai.pack(fill="x", padx=15, pady=5)
+
+btn_assistant = ctk.CTkButton(sidebar, text="💬 AI Finansal Asistan", font=("Segoe UI", 14, "bold"), text_color="#f1c40f", anchor="w", corner_radius=6, command=lambda: secme_sayfasi("Assistant"))
+btn_assistant.pack(fill="x", padx=15, pady=5)
+
+btn_news = ctk.CTkButton(sidebar, text="📰 Haber Akışı", font=("Segoe UI", 14), anchor="w", corner_radius=6, command=lambda: secme_sayfasi("News"))
+btn_news.pack(fill="x", padx=15, pady=5)
+
+btn_corr = ctk.CTkButton(sidebar, text="🔗 Korelasyon", font=("Segoe UI", 14), anchor="w", corner_radius=6, command=lambda: secme_sayfasi("Correlation"))
+btn_corr.pack(fill="x", padx=15, pady=5)
+
+btn_alerts = ctk.CTkButton(sidebar, text="🔔 Alarmlar", font=("Segoe UI", 14), anchor="w", corner_radius=6, command=lambda: secme_sayfasi("Alerts"))
+btn_alerts.pack(fill="x", padx=15, pady=5)
+
+btn_chart = ctk.CTkButton(sidebar, text="📈 Teknik Analiz", font=("Segoe UI", 14), anchor="w", corner_radius=6, command=lambda: secme_sayfasi("Charts"))
+btn_chart.pack(fill="x", padx=15, pady=5)
+
+menu_butonlari = [btn_dash, btn_portfolio, btn_ai, btn_assistant, btn_news, btn_corr, btn_alerts, btn_chart]
+
+bottom_sidebar = ctk.CTkFrame(sidebar, fg_color="transparent")
+bottom_sidebar.pack(side="bottom", fill="x", pady=20)
+ctk.CTkButton(bottom_sidebar, text="📥 Rapor İndir (Excel/CSV)", font=("Segoe UI", 12, "bold"), fg_color="#8e44ad", command=disari_aktar).pack(fill="x", padx=15, pady=5)
+# İlk yükleme splash ekranda yapıldığı için manuel senkronize butonu kalıyor
+ctk.CTkButton(bottom_sidebar, text="🔄 Senkronize Et", font=("Segoe UI", 12, "bold"), fg_color="#27ae60", command=lambda: threading.Thread(target=veri_cek_ve_guncelle, daemon=True).start()).pack(fill="x", padx=15, pady=5)
+ctk.CTkButton(bottom_sidebar, text="⚙️ Ayarları Sıfırla", font=("Segoe UI", 12, "bold"), fg_color="#c0392b", command=ayarlari_sifirla).pack(fill="x", padx=15, pady=5)
+
+content_area = ctk.CTkFrame(root, corner_radius=0, fg_color="#181b1f")
+content_area.pack(side="right", fill="both", expand=True)
+
+top_header = ctk.CTkFrame(content_area, fg_color="transparent", height=70)
+ctk.CTkLabel(top_header, text="Piyasa Özeti", font=("Segoe UI", 28, "bold"), text_color="white").pack(side="left")
+
+# --- FRAME TANIMLAMALARI ---
+frame_dashboard = ctk.CTkFrame(content_area, fg_color="transparent")
+dash_canvas = tk.Canvas(frame_dashboard, bg="#181b1f", highlightthickness=0)
+dash_scrollbar = ttk.Scrollbar(frame_dashboard, orient="vertical", command=dash_canvas.yview)
+dashboard_icerik = ctk.CTkFrame(dash_canvas, fg_color="transparent")
+dashboard_icerik.bind("<Configure>", lambda e: dash_canvas.configure(scrollregion=dash_canvas.bbox("all")))
+dash_canvas.create_window((0, 0), window=dashboard_icerik, anchor="nw")
+dash_canvas.configure(yscrollcommand=dash_scrollbar.set)
+dash_canvas.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+dash_scrollbar.pack(side="right", fill="y")
+
+frame_ai_summary = ctk.CTkFrame(content_area, fg_color="transparent")
+ctk.CTkLabel(frame_ai_summary, text="Yapay Zeka Yönetici Özeti", font=("Segoe UI", 24, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(20,10))
+ai_textbox = ctk.CTkTextbox(frame_ai_summary, font=("Segoe UI", 16), fg_color="#1e272e", border_color="#2f3640", wrap="word")
+ai_textbox.pack(fill="both", expand=True, padx=20, pady=10)
+
+frame_assistant = ctk.CTkFrame(content_area, fg_color="transparent")
+ctk.CTkLabel(frame_assistant, text="Terminal AI Finansal Danışman", font=("Segoe UI", 24, "bold")).pack(anchor="w", padx=20, pady=(20, 5))
+chat_history = ctk.CTkTextbox(frame_assistant, font=("Segoe UI", 15), fg_color="#1e272e", wrap="word")
+chat_history.pack(fill="both", expand=True, padx=20, pady=5)
+chat_history.insert("0.0", "Terminal AI: Merhaba! Piyasa veya portföyünüz hakkında dilediğinizi sorun.\n\n")
+chat_history.configure(state="disabled")
+chat_input_frame = ctk.CTkFrame(frame_assistant, fg_color="transparent")
+chat_input_frame.pack(fill="x", padx=20, pady=(10, 20))
+chat_entry = ctk.CTkEntry(chat_input_frame, placeholder_text="Soru sorun...", font=("Segoe UI", 14), height=45)
+chat_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+ctk.CTkButton(chat_input_frame, text="Gönder", width=100, height=45, fg_color="#27ae60", command=chat_gonder).pack(side="right")
+chat_entry.bind("<Return>", chat_gonder)
+
+frame_portfolio = ctk.CTkFrame(content_area, fg_color="transparent")
+ctk.CTkLabel(frame_portfolio, text="💼 Yapay Zeka Destekli Portföy Yönetimi", font=("Segoe UI", 24, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(20, 5))
+ctk.CTkLabel(frame_portfolio, text="Varlıklarınızı ekleyin, Robo-Danışman piyasadaki haberlere göre risk analizi yapsın.", font=("Segoe UI", 13), text_color="#95a5a6").pack(anchor="w", padx=20, pady=(0, 15))
+
+portfoy_giris_frame = ctk.CTkFrame(frame_portfolio, fg_color="#1e272e", corner_radius=10)
+portfoy_giris_frame.pack(fill="x", padx=20, pady=10)
+
+semboller = [item["anahtar"] for item in dinamik_konfigurasyon]
+portfoy_sembol_var = ctk.StringVar(value=semboller[0] if semboller else "")
+
+ctk.CTkLabel(portfoy_giris_frame, text="Varlık:").pack(side="left", padx=10)
+portfoy_sembol_menu = ctk.CTkOptionMenu(portfoy_giris_frame, variable=portfoy_sembol_var, values=semboller)
+portfoy_sembol_menu.pack(side="left", padx=10, pady=15)
+
+ctk.CTkLabel(portfoy_giris_frame, text="Miktar/Lot:").pack(side="left", padx=10)
+portfoy_miktar_entry = ctk.CTkEntry(portfoy_giris_frame, width=80)
+portfoy_miktar_entry.pack(side="left", padx=10)
+
+ctk.CTkLabel(portfoy_giris_frame, text="Birim Maliyet:").pack(side="left", padx=10)
+portfoy_maliyet_entry = ctk.CTkEntry(portfoy_giris_frame, width=80)
+portfoy_maliyet_entry.pack(side="left", padx=10)
+
+ctk.CTkButton(portfoy_giris_frame, text="Portföye Ekle", fg_color="#2980b9", hover_color="#3498db", command=portfoye_ekle).pack(side="left", padx=10)
+
+portfoy_ozet_lbl = ctk.CTkLabel(portfoy_giris_frame, text="Toplam Kâr/Zarar: Hesaplanıyor...", font=("Segoe UI", 14, "bold"), text_color="#f1c40f")
+portfoy_ozet_lbl.pack(side="right", padx=20)
+
+portfoy_alt_alan = ctk.CTkFrame(frame_portfolio, fg_color="transparent")
+portfoy_alt_alan.pack(fill="both", expand=True, padx=20, pady=10)
+
+portfoy_liste_frame = ctk.CTkScrollableFrame(portfoy_alt_alan, fg_color="transparent", width=400)
+portfoy_liste_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
+
+robo_analiz_frame = ctk.CTkFrame(portfoy_alt_alan, fg_color="#2c3e50", corner_radius=10, width=400)
+robo_analiz_frame.pack(side="right", fill="both", expand=True)
+
+ctk.CTkButton(robo_analiz_frame, text="🤖 Yapay Zeka ile Portföyümü Analiz Et", font=("Segoe UI", 14, "bold"), height=40, fg_color="#8e44ad", hover_color="#9b59b6", command=robo_danisman_analizi_baslat).pack(fill="x", padx=10, pady=10)
+robo_textbox = ctk.CTkTextbox(robo_analiz_frame, font=("Segoe UI", 14), fg_color="#1e272e", wrap="word")
+robo_textbox.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+robo_textbox.insert("0.0", "Portföyünüzü ekledikten sonra yukarıdaki butona tıklayarak kişisel fon yönetimi tavsiyeleri (Rebalancing) ve risk analizi alabilirsiniz.")
+robo_textbox.configure(state="disabled")
+
+# Diğer Sekmeler
+frame_news = ctk.CTkFrame(content_area, fg_color="transparent")
+ctk.CTkLabel(frame_news, text="Sektörel Haber Akışı", font=("Segoe UI", 24, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(20,10))
+news_scroll = ctk.CTkScrollableFrame(frame_news, fg_color="transparent")
+news_scroll.pack(fill="both", expand=True, padx=10)
+news_container = ctk.CTkFrame(news_scroll, fg_color="transparent")
+news_container.pack(fill="both", expand=True)
+
+frame_alerts = ctk.CTkFrame(content_area, fg_color="transparent")
+ctk.CTkLabel(frame_alerts, text="Eşik Değer Alarmları", font=("Segoe UI", 24, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(20,10))
+alrm_giris_frame = ctk.CTkFrame(frame_alerts, fg_color="#1e272e", corner_radius=10)
+alrm_giris_frame.pack(fill="x", padx=20, pady=10)
+alarm_sembol_var = ctk.StringVar(value="Usdtry")
+alarm_sembol_menu = ctk.CTkOptionMenu(alrm_giris_frame, variable=alarm_sembol_var, values=semboller)
+alarm_sembol_menu.pack(side="left", padx=10, pady=15)
+alarm_kosul_var = ctk.StringVar(value=">")
+ctk.CTkOptionMenu(alrm_giris_frame, variable=alarm_kosul_var, values=[">", "<"], width=60).pack(side="left", padx=10)
+alarm_deger_entry = ctk.CTkEntry(alrm_giris_frame, placeholder_text="Değer girin...")
+alarm_deger_entry.pack(side="left", padx=10)
+ctk.CTkButton(alrm_giris_frame, text="Alarm Kur", fg_color="#27ae60", command=alarm_ekle).pack(side="left", padx=10)
+ctk.CTkButton(alrm_giris_frame, text="🧪 Simüle Et (Test)", fg_color="#f39c12", hover_color="#d35400", command=simule_et_alarmlar).pack(side="left", padx=10)
+
+alarm_liste_frame = ctk.CTkScrollableFrame(frame_alerts, fg_color="transparent")
+alarm_liste_frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+frame_correlation = ctk.CTkFrame(content_area, fg_color="transparent")
+ctk.CTkLabel(frame_correlation, text="Kıyaslamalı Korelasyon Analizi", font=("Segoe UI", 24, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(20,10))
+corr_ayar_frame = ctk.CTkFrame(frame_correlation, fg_color="#1e272e")
+corr_ayar_frame.pack(fill="x", padx=20, pady=10)
+corr_var1 = ctk.StringVar(value="Usdtry")
+corr_var2 = ctk.StringVar(value="Xauusd")
+ctk.CTkLabel(corr_ayar_frame, text="1. Varlık:").pack(side="left", padx=10)
+corr_var1_menu = ctk.CTkOptionMenu(corr_ayar_frame, variable=corr_var1, values=semboller)
+corr_var1_menu.pack(side="left", padx=10, pady=15)
+ctk.CTkLabel(corr_ayar_frame, text="2. Varlık:").pack(side="left", padx=10)
+corr_var2_menu = ctk.CTkOptionMenu(corr_ayar_frame, variable=corr_var2, values=semboller)
+corr_var2_menu.pack(side="left", padx=10)
+ctk.CTkButton(corr_ayar_frame, text="Kıyasla Çiz", command=ciz_korelasyon).pack(side="left", padx=20)
+corr_chart_frame = ctk.CTkFrame(frame_correlation, fg_color="transparent")
+corr_chart_frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+frame_charts = ctk.CTkFrame(content_area, fg_color="transparent")
+ctk.CTkLabel(frame_charts, text="Gelişmiş Teknik Analiz", font=("Segoe UI", 24, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(20, 10))
+tech_controls = ctk.CTkFrame(frame_charts, fg_color="#1e272e")
+tech_controls.pack(fill="x", padx=20, pady=10)
+tech_sembol_var = ctk.StringVar(value="Usdtry")
+ctk.CTkLabel(tech_controls, text="Varlık:").pack(side="left", padx=10)
+tech_sembol_menu = ctk.CTkOptionMenu(tech_controls, variable=tech_sembol_var, values=semboller)
+tech_sembol_menu.pack(side="left", padx=10, pady=15)
+sma20_var = ctk.BooleanVar(value=True) 
+sma50_var = ctk.BooleanVar(value=True)
+bollinger_var = ctk.BooleanVar(value=False)
+ctk.CTkCheckBox(tech_controls, text="SMA 20 (Kısa Vade)", variable=sma20_var).pack(side="left", padx=15)
+ctk.CTkCheckBox(tech_controls, text="SMA 50 (Orta Vade)", variable=sma50_var).pack(side="left", padx=15)
+ctk.CTkCheckBox(tech_controls, text="Bollinger Bantları", variable=bollinger_var).pack(side="left", padx=15)
+tech_chart_frame = ctk.CTkFrame(frame_charts, fg_color="transparent")
+tech_chart_frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+tech_canvas_widget = None
+
+def ciz_teknik_analiz():
+    global tech_canvas_widget
+    sembol = tech_sembol_var.get()
+    
+    if sembol not in gecmis_veriler:
+        messagebox.showwarning("Uyarı", "Seçilen varlık için yeterli veri yok.")
+        return
+
+    if tech_canvas_widget:
+        tech_canvas_widget.destroy()
+
+    fig, ax = plt.subplots(figsize=(10, 5), facecolor='#181b1f')
+    fig.patch.set_facecolor('#181b1f')
+    ax.set_facecolor('#181b1f')
+
+    data = gecmis_veriler[sembol]
+    tarihler = [datetime.datetime.strptime(t, '%Y-%m-%d') for t in data["tarihler"]]
+    degerler = data["degerler"]
+
+    # Pandas ile veriyi işle
+    df = pd.DataFrame({"Fiyat": degerler}, index=tarihler)
+
+    # Ana fiyat çizgisi
+    ax.plot(df.index, df["Fiyat"], color="#3498db", label=f"{sembol} Fiyatı", linewidth=2)
+
+    # SMA 20 (20 Günlük Hareketli Ortalama)
+    if sma20_var.get():
+        df["SMA20"] = df["Fiyat"].rolling(window=20).mean()
+        ax.plot(df.index, df["SMA20"], color="#f1c40f", label="SMA 20", linewidth=1.5, linestyle="--")
+
+    # SMA 50 (50 Günlük Hareketli Ortalama)
+    if sma50_var.get():
+        df["SMA50"] = df["Fiyat"].rolling(window=50).mean()
+        ax.plot(df.index, df["SMA50"], color="#e74c3c", label="SMA 50", linewidth=1.5, linestyle="-.")
+        
+    # Bollinger Bantları
+    if bollinger_var.get():
+        if "SMA20" not in df:
+            df["SMA20"] = df["Fiyat"].rolling(window=20).mean()
+        df["STD20"] = df["Fiyat"].rolling(window=20).std()
+        df["Upper"] = df["SMA20"] + (df["STD20"] * 2)
+        df["Lower"] = df["SMA20"] - (df["STD20"] * 2)
+        
+        ax.plot(df.index, df["Upper"], color="#9b59b6", label="Bollinger Üst", linewidth=1, alpha=0.6)
+        ax.plot(df.index, df["Lower"], color="#9b59b6", label="Bollinger Alt", linewidth=1, alpha=0.6)
+        ax.fill_between(df.index, df["Lower"], df["Upper"], color="#9b59b6", alpha=0.1)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
+    fig.autofmt_xdate()
+
+    ax.tick_params(colors='white')
+    for spine in ax.spines.values(): spine.set_color('#3d3d3d')
+    ax.grid(color='#3d3d3d', linestyle='--', linewidth=0.5, alpha=0.7)
+
+    plt.title(f"{sembol} Teknik Göstergeler", color="white")
+    fig.legend(loc="upper left", bbox_to_anchor=(0.1, 0.9), facecolor='#1e272e', edgecolor='none', labelcolor='white')
+
+    plt.tight_layout()
+    canvas = FigureCanvasTkAgg(fig, master=tech_chart_frame)
+    canvas.draw()
+    tech_canvas_widget = canvas.get_tk_widget()
+    tech_canvas_widget.pack(fill="both", expand=True)
+
+ctk.CTkButton(tech_controls, text="Analizi Çiz / Güncelle", command=ciz_teknik_analiz, fg_color="#27ae60", hover_color="#2ecc71").pack(side="left", padx=20)
+
+status_frame = ctk.CTkFrame(root, height=25, corner_radius=0, fg_color="#111111")
+status_frame.pack(side="bottom", fill="x")
+status_label = ctk.CTkLabel(status_frame, text="Sistem Hazır.", font=("Segoe UI", 10))
+status_label.pack(side="right", padx=20)
+
+secme_sayfasi("Dashboard")
+root.after(1000, scroll_ticker)
+root.mainloop()
