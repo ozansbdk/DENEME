@@ -43,7 +43,7 @@ WEBHOOKS = {
 }
 
 # ── Gemini AI API ──
-GEMINI_API_KEY = "AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI"   # Google AI Studio'dan alınan key
+GEMINI_API_KEY = ""   # Google AI Studio'dan alınan key
 GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
 CACHE_FILE = "seen_products.json"
