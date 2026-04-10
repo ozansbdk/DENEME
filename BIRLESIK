@@ -21,6 +21,7 @@ except ImportError:
     print("customtkinter bulunamadı: pip install customtkinter")
     sys.exit(1)
 
+import tkinter as tk
 from tkinter import messagebox, filedialog
 
 from openpyxl import Workbook, load_workbook
@@ -47,6 +48,7 @@ GEMINI_API_KEY = ""   # Google AI Studio'dan alınan key
 GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
 CACHE_FILE = "seen_products.json"
+HAFTALIK_DOSYA = "haftalik_tarih.json"
 EXCEL_DIR  = "outputs"
 EXCEL_FILE = os.path.join(EXCEL_DIR, "yeni_urunler_log.xlsx")
 
@@ -80,6 +82,7 @@ bot_durumu = {
     "log_satirlari": [],
     "ai_sonuc": "",
     "urun_listesi": {},   # marka_ad → ürün listesi (dashboard detay için)
+    "son_eklenenler": [],  # Son eklenen ürünler [{isim,fiyat,link,gorsel,marka_ad}]
 }
 
 
@@ -257,6 +260,32 @@ def cache_urunler(v):
 def save_cache(d):
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump({"markalar": d, "son_guncelleme": datetime.now().isoformat()}, f, ensure_ascii=False, indent=2)
+
+
+def haftalik_yukle() -> dict:
+    """Haftalık yeni ürün geçmişini yükle: {ISO-hafta → toplam_yeni}"""
+    if os.path.exists(HAFTALIK_DOSYA):
+        try:
+            with open(HAFTALIK_DOSYA, encoding="utf-8") as f:
+                return json.load(f)
+        except: pass
+    return {}
+
+
+def haftalik_kaydet(yeni_sayisi: int):
+    """Bu haftanın verisi güncelle."""
+    veri = haftalik_yukle()
+    hafta_no = datetime.now().isocalendar()[1]
+    yil = datetime.now().year
+    anahtar = f"{yil}-W{hafta_no:02d}"
+    veri[anahtar] = veri.get(anahtar, 0) + yeni_sayisi
+    # Son 16 haftayı sakla
+    anahtarlar = sorted(veri.keys())[-16:]
+    veri = {k: veri[k] for k in anahtarlar}
+    try:
+        with open(HAFTALIK_DOSYA, "w", encoding="utf-8") as f:
+            json.dump(veri, f, ensure_ascii=False, indent=2)
+    except: pass
 
 def webhook(cinsiyet): return WEBHOOKS.get(cinsiyet, WEBHOOKS["kadin"])
 
@@ -832,177 +861,6 @@ def inditex_api_cek(marka_url: str, accept_lang: str) -> list:
             cur = price_obj.get("currency", "") if isinstance(price_obj, dict) else ""
             urunler.append({"isim": name, "fiyat": f"{amt} {cur}".strip(), "link": link, "gorsel": gorsel})
     return urunler
-    """URL'den Zara kategori ID'sini çıkar: ?v1=2546081 → 2546081"""
-    m = _re.search(r'[?&]v1=(\d+)', url)
-    return m.group(1) if m else ""
-
-def _zara_base_path(url: str) -> str:
-    """https://www.zara.com/tr/tr/... → /tr/tr"""
-    parts = url.replace("https://www.zara.com","").split("/")
-    return "/" + "/".join(p for p in parts[:3] if p)
-
-def zara_api_cek(marka_url: str, accept_lang: str) -> list:
-    """Zara REST API ile ürünleri çek — browser gerektirmez."""
-    cat_id = _zara_kategori_id(marka_url)
-    if not cat_id:
-        return []
-    base_path = _zara_base_path(marka_url)
-    origin = "https://www.zara.com"
-    api_url = f"{origin}{base_path}/category/{cat_id}/products?ajax=true"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": accept_lang,
-        "Referer": marka_url,
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "sec-ch-ua": '"Chromium";v="124","Google Chrome";v="124","Not-A.Brand";v="99"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-    }
-    try:
-        resp = requests.get(api_url, headers=headers, timeout=20)
-        if resp.status_code != 200:
-            return []
-        data = resp.json()
-    except Exception:
-        return []
-
-    urunler = []
-    elements = data if isinstance(data, list) else data.get("elements", data.get("productGroups", []))
-    # productGroups bazlı yanıt
-    if isinstance(elements, list) and elements and isinstance(elements[0], dict):
-        # Düz liste mi, yoksa grup listesi mi?
-        if "elements" in elements[0]:
-            flat = []
-            for grp in elements:
-                flat.extend(grp.get("elements", []))
-            elements = flat
-
-    seen = set()
-    for el in elements:
-        if not isinstance(el, dict):
-            continue
-        # İç içe commercialComponents varsa
-        for prod in el.get("commercialComponents", [el]):
-            if not isinstance(prod, dict):
-                continue
-            name = prod.get("name") or ""
-            if not name or len(name) < 2:
-                continue
-            seo = prod.get("seo", {}) or {}
-            seo_url = seo.get("url", "")
-            if seo_url:
-                link = seo_url if seo_url.startswith("http") else origin + seo_url
-            else:
-                keyword = seo.get("keyword", "")
-                if keyword:
-                    link = f"{origin}{base_path}/{keyword}.html"
-                else:
-                    pid = prod.get("id", "")
-                    link = f"{origin}{base_path}/p{pid}.html" if pid else ""
-            if not link or link in seen:
-                continue
-            seen.add(link)
-            gorsel = ""
-            for media in (prod.get("xmedia") or prod.get("images") or []):
-                if isinstance(media, dict):
-                    raw = media.get("url", "") or media.get("path", "")
-                    if raw:
-                        gorsel = (raw if raw.startswith("http") else "https:" + raw)
-                        gorsel = gorsel.split("?")[0] + "?ts=1&w=600&f=auto"
-                        break
-            price_obj = prod.get("price") or {}
-            if isinstance(price_obj, dict):
-                amt = price_obj.get("value") or price_obj.get("formattedAmount") or ""
-                cur = price_obj.get("currency", "")
-                fiyat = f"{amt} {cur}".strip()
-            else:
-                prices = prod.get("prices", [])
-                fiyat = prices[0].get("formattedAmount", "") if prices else ""
-            urunler.append({"isim": name, "fiyat": fiyat, "link": link, "gorsel": gorsel})
-    return urunler
-
-
-# ── Inditex JSON API (Massimo Dutti, Bershka) ──
-def _inditex_kategori_id(url: str) -> str:
-    """URL'den Inditex kategori n-ID'sini çıkar: yenilik-n1474 → 1474"""
-    m = _re.search(r'-n(\d+)', url.split('?')[0])
-    return m.group(1) if m else ""
-
-def inditex_api_cek(marka_url: str, accept_lang: str) -> list:
-    """Massimo Dutti / Bershka JSON API ile ürünleri çek."""
-    cat_id = _inditex_kategori_id(marka_url)
-    if not cat_id:
-        return []
-    from urllib.parse import urlparse
-    parsed = urlparse(marka_url)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    parts = parsed.path.strip("/").split("/")  # ['tr', 'kadin', 'yenilik-n1474']
-    country = parts[0] if len(parts) > 0 else "es"
-    api_url = f"{origin}/{country}/category/{cat_id}/products?ajax=true"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": accept_lang,
-        "Referer": marka_url,
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-    }
-    try:
-        resp = requests.get(api_url, headers=headers, timeout=20)
-        if resp.status_code != 200:
-            return []
-        data = resp.json()
-    except Exception:
-        return []
-
-    urunler = []
-    elements = data if isinstance(data, list) else data.get("elements", data.get("productGroups", []))
-    if isinstance(elements, list) and elements and isinstance(elements[0], dict) and "elements" in elements[0]:
-        flat = []
-        for grp in elements:
-            flat.extend(grp.get("elements", []))
-        elements = flat
-
-    seen = set()
-    for el in elements:
-        if not isinstance(el, dict):
-            continue
-        for prod in el.get("commercialComponents", [el]):
-            if not isinstance(prod, dict):
-                continue
-            name = prod.get("name") or ""
-            if not name or len(name) < 2:
-                continue
-            seo = prod.get("seo", {}) or {}
-            seo_url = seo.get("url", "")
-            link = (seo_url if seo_url.startswith("http") else origin + seo_url) if seo_url else ""
-            if not link:
-                keyword = seo.get("keyword", "")
-                parts2 = parsed.path.strip("/").split("/")
-                if keyword and len(parts2) >= 2:
-                    link = f"{origin}/{parts2[0]}/{keyword}"
-            if not link or link in seen:
-                continue
-            seen.add(link)
-            gorsel = ""
-            for media in (prod.get("xmedia") or prod.get("images") or []):
-                if isinstance(media, dict):
-                    raw = media.get("url", "") or media.get("path", "")
-                    if raw:
-                        gorsel = (raw if raw.startswith("http") else "https:" + raw)
-                        gorsel = gorsel.split("?")[0] + "?w=600"
-                        break
-            price_obj = prod.get("price") or {}
-            amt = (price_obj.get("value") or price_obj.get("formattedAmount") or "") if isinstance(price_obj, dict) else ""
-            cur = price_obj.get("currency", "") if isinstance(price_obj, dict) else ""
-            urunler.append({"isim": name, "fiyat": f"{amt} {cur}".strip(), "link": link, "gorsel": gorsel})
-    return urunler
-
-
 # ── Locale → Accept-Language haritası ──
 _LANG_MAP = {
     "tr-TR": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -1112,6 +970,16 @@ async def tara(browser, marka):
                 urunler = await page.evaluate(ZARA_JS, marka["url"])
 
         elif tip == "stradivarius":
+            # 1. API önce dene (Inditex API pattern)
+            loop = asyncio.get_event_loop()
+            urunler = await loop.run_in_executor(
+                None, inditex_api_cek, marka["url"], accept_lang)
+            if urunler:
+                log(f"   ✓ {marka['ad']}: {len(urunler)} ürün (API)")
+                await ctx.close()
+                return urunler
+            # 2. API başarısız → browser ile aç
+            log(f"   ⚠️ {marka['ad']}: API boş, browser ile deneniyor...")
             await page.goto(marka["url"], wait_until="networkidle", timeout=60000)
             await page.wait_for_timeout(3000)
             await kapat_popup(page); await page.wait_for_timeout(600); await kapat_popup(page)
@@ -1457,6 +1325,16 @@ async def tek_tur_async(tur_no):
     bot_durumu["son_guncelleme"] = datetime.now(ISTANBUL_TZ).strftime("%d.%m.%Y %H:%M:%S")
     bot_durumu["calisiyor"] = False
 
+    # Son eklenenler — dashboard thumbnail için
+    if not ilk_tur and excel_kayitlar:
+        yeni_urunler_son = []
+        for kayit in excel_kayitlar:
+            u = dict(kayit["urun"])
+            u["marka_ad"] = kayit["marka_ad"]
+            yeni_urunler_son.append(u)
+        bot_durumu["son_eklenenler"] = (yeni_urunler_son + bot_durumu.get("son_eklenenler", []))[:100]
+        haftalik_kaydet(sum(sayac.values()))
+
     sure = (datetime.now() - start).seconds
     log(f"✅ Tur #{tur_no} bitti — {sure//60}dk {sure%60}sn")
     if ilk_tur:
@@ -1677,9 +1555,147 @@ def secme_sayfasi(sayfa_adi):
 CINSIYET_RENK = {"kadin": "#e91e63", "erkek": "#2196f3", "cocuk": "#4caf50"}
 
 dash_scroll = ctk.CTkScrollableFrame(frame_dashboard, fg_color="transparent")
-dash_scroll.pack(fill="both", expand=True, padx=10, pady=10)
+dash_scroll.pack(fill="both", expand=True, padx=0, pady=0)
 
 _detay_img_refs = []  # Görsel referanslarını GC'den korur
+
+
+# ── Dashboard yardımcı fonksiyonlar ──
+
+def _en_aktif_marka() -> str:
+    """En çok yeni ürün bulunan markanın kısa adını döndür."""
+    en = max(
+        ((ad, d.get("yeni", 0)) for ad, d in bot_durumu["marka_durumlari"].items()),
+        key=lambda x: x[1], default=("—", 0))
+    if en[1] == 0:
+        return "—"
+    for isim in ["Zara", "Defacto", "Massimo Dutti", "MD", "Stradivarius", "Bershka",
+                 "YSL", "Uniqlo", "Aritzia", "Brandy"]:
+        if isim.lower() in en[0].lower():
+            return isim
+    return en[0][:12]
+
+
+def _haftalik_degisim() -> str:
+    """Bu hafta ile geçen haftanın toplamını karşılaştır."""
+    veri = haftalik_yukle()
+    if len(veri) < 2:
+        return "—"
+    anahtarlar = sorted(veri.keys())
+    bu_hafta = veri[anahtarlar[-1]]
+    gecen_hafta = veri[anahtarlar[-2]]
+    if gecen_hafta == 0:
+        return "—"
+    oran = (bu_hafta - gecen_hafta) / gecen_hafta * 100
+    isaret = "+" if oran >= 0 else ""
+    return f"{isaret}{oran:.1f}%"
+
+
+def _son_eklenen_urunler(n: int = 12) -> list:
+    """Son eklenen ürünlerin ilk n tanesini döndür."""
+    return bot_durumu.get("son_eklenenler", [])[:n]
+
+
+def _ciz_cizgi_grafik(parent):
+    """Haftalık yeni ürün trendi — tk.Canvas ile çiz."""
+    W, H = 520, 180
+    canvas = tk.Canvas(parent, width=W, height=H, bg="#1e272e", highlightthickness=0)
+    canvas.pack(padx=15, pady=(0, 15))
+
+    veri = haftalik_yukle()
+    anahtarlar = sorted(veri.keys())[-8:]
+    degerler = [veri.get(k, 0) for k in anahtarlar]
+    if not degerler or max(degerler) == 0:
+        canvas.create_text(W//2, H//2, text="Veri yok — ilk tur tamamlandıktan sonra görünecek",
+                           fill="#7f8c8d", font=("Segoe UI", 10))
+        return
+
+    PAD_L, PAD_R, PAD_T, PAD_B = 40, 10, 10, 35
+    gW = W - PAD_L - PAD_R
+    gH = H - PAD_T - PAD_B
+    maks = max(degerler) or 1
+
+    # Grid çizgileri
+    for i in range(5):
+        y = PAD_T + gH - int(gH * i / 4)
+        canvas.create_line(PAD_L, y, W - PAD_R, y, fill="#2f3640", width=1)
+        canvas.create_text(PAD_L - 4, y, text=str(int(maks * i / 4)),
+                           fill="#7f8c8d", font=("Segoe UI", 8), anchor="e")
+
+    # Hafta etiketleri & koordinatlar
+    N = len(degerler)
+    pts = []
+    for i, (k, v) in enumerate(zip(anahtarlar, degerler)):
+        x = PAD_L + int(gW * i / max(N - 1, 1))
+        y = PAD_T + gH - int(gH * v / maks)
+        pts.append((x, y))
+        hafta = k.split("-W")[-1] if "-W" in k else k
+        canvas.create_text(x, H - PAD_B + 12, text=f"H{hafta}",
+                           fill="#7f8c8d", font=("Segoe UI", 8))
+
+    # Dolgu alanı
+    if len(pts) >= 2:
+        poly = [pts[0][0], PAD_T + gH]
+        for x, y in pts:
+            poly += [x, y]
+        poly += [pts[-1][0], PAD_T + gH]
+        canvas.create_polygon(poly, fill="#1a3352", outline="")
+
+    # Çizgi
+    for i in range(len(pts) - 1):
+        canvas.create_line(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1],
+                           fill="#e67e22", width=2)
+
+    # Noktalar
+    for x, y in pts:
+        canvas.create_oval(x-3, y-3, x+3, y+3, fill="#e67e22", outline="#f39c12")
+
+
+def _ciz_donut_grafik(parent):
+    """Marka dağılımı — tk.Canvas ile donut chart çiz."""
+    W, H = 300, 180
+    canvas = tk.Canvas(parent, width=W, height=H, bg="#1e272e", highlightthickness=0)
+    canvas.pack(padx=15, pady=(0, 15))
+
+    # Marka gruplarına göre toplam ürün sayısı
+    GRUPLAR = [
+        ("Zara", "#e67e22"), ("Defacto", "#e74c3c"), ("MD", "#9b59b6"),
+        ("Bershka", "#3498db"), ("Stradivarius", "#2ecc71"), ("Uniqlo", "#1abc9c"),
+        ("YSL", "#f1c40f"), ("Aritzia", "#e91e63"), ("Brandy", "#fd79a8"), ("Diğer", "#636e72"),
+    ]
+    grup_say = {g: 0 for g, _ in GRUPLAR}
+    for ad, d in bot_durumu["marka_durumlari"].items():
+        s = d.get("urun_sayisi", 0)
+        es = False
+        for g, _ in GRUPLAR:
+            if g.lower() in ad.lower():
+                grup_say[g] += s; es = True; break
+        if not es:
+            grup_say["Diğer"] += s
+
+    toplam = sum(grup_say.values()) or 1
+    aktif = [(g, s, c) for (g, c), s in zip(
+        {g: c for g, c in GRUPLAR}.items(), grup_say.values()) if s > 0]
+
+    cx, cy, R, r = W // 2 - 30, H // 2, 70, 42
+    start = -90.0
+    for g, s, c in aktif:
+        extent = 360.0 * s / toplam
+        canvas.create_arc(cx-R, cy-R, cx+R, cy+R, start=start, extent=extent,
+                          fill=c, outline="#1e272e", width=2, style="pieslice")
+        canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill="#1e272e", outline="#1e272e")
+        start += extent
+
+    canvas.create_text(cx, cy, text=str(toplam), font=("Segoe UI", 16, "bold"), fill="white")
+    canvas.create_text(cx, cy + 16, text="TOPLAM", font=("Segoe UI", 7), fill="#7f8c8d")
+
+    # Lejant
+    lx = W - 85
+    for i, (g, s, c) in enumerate(aktif[:8]):
+        ly = 15 + i * 20
+        canvas.create_rectangle(lx, ly, lx+10, ly+10, fill=c, outline="")
+        canvas.create_text(lx + 14, ly + 5, text=f"{g} {s}",
+                           fill="#bdc3c7", font=("Segoe UI", 8), anchor="w")
 
 
 def goster_marka_detay(marka_ad):
@@ -1688,21 +1704,32 @@ def goster_marka_detay(marka_ad):
     if not urunler:
         messagebox.showinfo("Bilgi", f"'{marka_ad}' için ürün verisi yok.\nBotu çalıştırın.")
         return
+    _ac_galeri(urunler, f"📦 {marka_ad}  —  {len(urunler)} ürün")
 
+
+def goster_tum_galeri():
+    """Tüm yeni ürünleri tek galeride göster."""
+    son = bot_durumu.get("son_eklenenler", [])
+    if not son:
+        messagebox.showinfo("Bilgi", "Henüz yeni ürün yok.\nBotu çalıştırın.")
+        return
+    _ac_galeri(son, f"🛍️ Tüm Yeni Ürünler — {len(son)} ürün")
+
+
+def _ac_galeri(urunler, baslik):
+    """Resimli ürün galerisi penceresi aç."""
     modal = ctk.CTkToplevel(root)
-    modal.title(f"📦 {marka_ad}  —  {len(urunler)} ürün")
-    modal.geometry("1140x740")
+    modal.title(baslik)
+    modal.geometry("1180x760")
     modal.configure(fg_color="#181b1f")
     modal.attributes("-topmost", True)
 
-    # ── Başlık ──
-    hdr = ctk.CTkFrame(modal, fg_color="#2c3e50", corner_radius=0, height=60)
+    hdr = ctk.CTkFrame(modal, fg_color="#2c3e50", corner_radius=0, height=55)
     hdr.pack(fill="x")
     hdr.pack_propagate(False)
-    ctk.CTkLabel(hdr, text=f"📦  {marka_ad}", font=("Segoe UI", 20, "bold"), text_color="white").pack(side="left", padx=20, pady=12)
-    ctk.CTkLabel(hdr, text=f"{len(urunler)} ürün", font=("Segoe UI", 13), text_color="#bdc3c7").pack(side="right", padx=20)
+    ctk.CTkLabel(hdr, text=baslik, font=("Segoe UI", 17, "bold"), text_color="white").pack(side="left", padx=20, pady=12)
+    ctk.CTkLabel(hdr, text=f"{len(urunler)} ürün", font=("Segoe UI", 12), text_color="#bdc3c7").pack(side="right", padx=20)
 
-    # ── Ürün ızgarası ──
     scroll_f = ctk.CTkScrollableFrame(modal, fg_color="transparent")
     scroll_f.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -1710,47 +1737,41 @@ def goster_marka_detay(marka_ad):
     for c in range(COLS):
         scroll_f.grid_columnconfigure(c, weight=1)
 
-    for idx, urun in enumerate(urunler[:120]):
+    for idx, urun in enumerate(urunler[:200]):
         r, c = divmod(idx, COLS)
         card = ctk.CTkFrame(scroll_f, fg_color="#1e272e", corner_radius=10,
-                            border_width=1, border_color="#2f3640", width=250, height=260)
+                            border_width=1, border_color="#2f3640", width=255, height=270)
         card.grid(row=r, column=c, padx=5, pady=5, sticky="nsew")
         card.grid_propagate(False)
 
-        # Görsel alanı
-        img_lbl = ctk.CTkLabel(card, text="⏳", font=("Segoe UI", 26),
-                               fg_color="#151a1f", width=238, height=140, corner_radius=8)
+        img_lbl = ctk.CTkLabel(card, text="⏳", font=("Segoe UI", 24),
+                               fg_color="#151a1f", width=243, height=150, corner_radius=8,
+                               cursor="hand2")
         img_lbl.place(x=6, y=6)
 
-        # Ürün adı
-        isim_lbl = ctk.CTkLabel(card, text=(urun.get("isim") or "—")[:36],
-                                font=("Segoe UI", 11, "bold"), text_color="white",
-                                wraplength=230, justify="left", anchor="w")
-        isim_lbl.place(x=8, y=153)
+        isim_lbl = ctk.CTkLabel(card, text=(urun.get("isim") or "—")[:38],
+                                font=("Segoe UI", 10, "bold"), text_color="white",
+                                wraplength=240, justify="left", anchor="w")
+        isim_lbl.place(x=8, y=160)
 
-        # Fiyat
-        fiyat = (urun.get("fiyat") or "").strip()[:24]
-        fiyat_lbl = ctk.CTkLabel(card, text=fiyat, font=("Segoe UI", 12, "bold"),
-                                 text_color="#f1c40f", anchor="w")
-        fiyat_lbl.place(x=8, y=195)
+        fiyat = (urun.get("fiyat") or "").strip()[:28]
+        ctk.CTkLabel(card, text=fiyat, font=("Segoe UI", 11, "bold"),
+                     text_color="#f1c40f", anchor="w").place(x=8, y=200)
 
-        # Link butonu
         link = urun.get("link", "")
         if link:
-            btn = ctk.CTkButton(card, text="🔗 İncele", height=26, font=("Segoe UI", 11),
+            btn = ctk.CTkButton(card, text="🔗 İncele", height=26, font=("Segoe UI", 10),
                                 fg_color="#2980b9", hover_color="#3498db",
                                 command=lambda l=link: webbrowser.open(l))
-            btn.place(x=8, y=224, width=232)
+            btn.place(x=8, y=232, width=238)
 
-        # Görsel asenkron yükle
         gorsel = urun.get("gorsel", "")
         if gorsel and gorsel.startswith("http"):
             def _load_img(url, lbl, mod):
                 try:
-                    resp = requests.get(url, timeout=6,
-                                        headers={"User-Agent": "Mozilla/5.0"})
+                    resp = requests.get(url, timeout=7, headers={"User-Agent": "Mozilla/5.0"})
                     pil_img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
-                    pil_img.thumbnail((238, 140), PILImage.LANCZOS)
+                    pil_img.thumbnail((243, 150), PILImage.LANCZOS)
                     ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img,
                                            size=(pil_img.width, pil_img.height))
                     _detay_img_refs.append(ctk_img)
@@ -1758,22 +1779,155 @@ def goster_marka_detay(marka_ad):
                         mod.after(0, lambda lb=lbl, ci=ctk_img: lb.configure(image=ci, text=""))
                     except: pass
                 except:
-                    try:
-                        mod.after(0, lambda lb=lbl: lb.configure(text="🖼️"))
+                    try: mod.after(0, lambda lb=lbl: lb.configure(text="🖼️"))
                     except: pass
             threading.Thread(target=_load_img, args=(gorsel, img_lbl, modal), daemon=True).start()
+
+        # Görsel tıklanabilir
+        if link:
+            img_lbl.bind("<Button-1>", lambda e, l=link: webbrowser.open(l))
 
     modal.focus_force()
 
 
+def _urun_thumb_kart(parent, urun):
+    """Son eklenenler satırı için tek ürün thumbnail kartı."""
+    card = ctk.CTkFrame(parent, fg_color="#252d35", corner_radius=10,
+                        border_width=1, border_color="#2f3640",
+                        width=140, height=200, cursor="hand2")
+    card.pack(side="left", padx=6, pady=4)
+    card.pack_propagate(False)
+
+    img_lbl = ctk.CTkLabel(card, text="⏳", font=("Segoe UI", 18),
+                           fg_color="#1a2129", width=128, height=130,
+                           corner_radius=8, cursor="hand2")
+    img_lbl.pack(pady=(6, 4), padx=6)
+
+    isim = (urun.get("isim") or "—")[:22]
+    ctk.CTkLabel(card, text=isim, font=("Segoe UI", 9, "bold"), text_color="white",
+                 wraplength=128).pack(padx=5)
+    fiyat = (urun.get("fiyat") or "").strip()[:18]
+    if fiyat:
+        ctk.CTkLabel(card, text=fiyat, font=("Segoe UI", 9, "bold"),
+                     text_color="#f1c40f").pack()
+
+    link = urun.get("link", "")
+    gorsel = urun.get("gorsel", "")
+
+    if gorsel and gorsel.startswith("http"):
+        def _load(url, lbl):
+            try:
+                resp = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+                pil_img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
+                pil_img.thumbnail((128, 130), PILImage.LANCZOS)
+                ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img,
+                                       size=(pil_img.width, pil_img.height))
+                _detay_img_refs.append(ctk_img)
+                try: root.after(0, lambda: lbl.configure(image=ctk_img, text=""))
+                except: pass
+            except:
+                try: root.after(0, lambda: lbl.configure(text="🖼️"))
+                except: pass
+        threading.Thread(target=_load, args=(gorsel, img_lbl), daemon=True).start()
+
+    if link:
+        for w in (card, img_lbl):
+            w.bind("<Button-1>", lambda e, l=link: webbrowser.open(l))
+
+
 def guncelle_dashboard_kartlari():
+    """Yeni dashboard: KPI satırı + grafikler + son eklenenler."""
     for w in dash_scroll.winfo_children():
         w.destroy()
+
+    toplam_yeni = sum(bot_durumu["toplam_yeni"].values())
+    toplam_urun = sum(d.get("urun_sayisi", 0) for d in bot_durumu["marka_durumlari"].values())
+
+    # ─── KPI Satırı ───
+    kpi_frame = ctk.CTkFrame(dash_scroll, fg_color="transparent")
+    kpi_frame.pack(fill="x", padx=15, pady=(15, 5))
+    for i in range(6):
+        kpi_frame.grid_columnconfigure(i, weight=1)
+
+    kpi_data = [
+        ("👥", str(len(MARKALAR)),              "Takip Edilen Marka"),
+        ("📦", str(toplam_yeni),                 "Bu Hafta Yeni Ürün"),
+        ("📈", _haftalik_degisim(),              "Haftalık Değişim"),
+        ("⚡", _en_aktif_marka(),                "En Aktif Marka"),
+        ("🛍️", str(toplam_urun),               "Toplam Ürün"),
+        ("🕐", bot_durumu["son_guncelleme"][-8:] if bot_durumu["son_guncelleme"] != "Hiç çalışmadı"
+               else "—",                         "Son Güncelleme"),
+    ]
+    for i, (icon, val, label) in enumerate(kpi_data):
+        c = ctk.CTkFrame(kpi_frame, fg_color="#1e272e", corner_radius=12,
+                         border_width=1, border_color="#2f3640")
+        c.grid(row=0, column=i, padx=5, sticky="nsew")
+        ctk.CTkLabel(c, text=f"{icon}  KPI", font=("Segoe UI", 9),
+                     text_color="#636e72").pack(anchor="e", padx=10, pady=(8, 0))
+        ctk.CTkLabel(c, text=val, font=("Segoe UI", 24, "bold"), text_color="white").pack(padx=10)
+        ctk.CTkLabel(c, text=label, font=("Segoe UI", 10), text_color="#bdc3c7").pack(padx=10, pady=(0, 10))
+
+    # ─── Grafik Satırı ───
+    chart_outer = ctk.CTkFrame(dash_scroll, fg_color="transparent")
+    chart_outer.pack(fill="x", padx=15, pady=5)
+    chart_outer.grid_columnconfigure(0, weight=3)
+    chart_outer.grid_columnconfigure(1, weight=2)
+
+    line_card = ctk.CTkFrame(chart_outer, fg_color="#1e272e", corner_radius=12,
+                             border_width=1, border_color="#2f3640")
+    line_card.grid(row=0, column=0, padx=(0, 6), sticky="nsew")
+    ctk.CTkLabel(line_card, text="Haftalık Yeni Ürün Trendi",
+                 font=("Segoe UI", 13, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(12, 4))
+    _ciz_cizgi_grafik(line_card)
+
+    donut_card = ctk.CTkFrame(chart_outer, fg_color="#1e272e", corner_radius=12,
+                              border_width=1, border_color="#2f3640")
+    donut_card.grid(row=0, column=1, padx=(6, 0), sticky="nsew")
+    ctk.CTkLabel(donut_card, text="Marka Dağılımı",
+                 font=("Segoe UI", 13, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(12, 4))
+    _ciz_donut_grafik(donut_card)
+
+    # ─── Son Eklenen Ürünler ───
+    son_card = ctk.CTkFrame(dash_scroll, fg_color="#1e272e", corner_radius=12,
+                            border_width=1, border_color="#2f3640")
+    son_card.pack(fill="x", padx=15, pady=(5, 15))
+
+    hdr2 = ctk.CTkFrame(son_card, fg_color="transparent")
+    hdr2.pack(fill="x", padx=20, pady=(12, 4))
+    ctk.CTkLabel(hdr2, text="Son Eklenen Ürünler",
+                 font=("Segoe UI", 13, "bold"), text_color="white").pack(side="left")
+    ctk.CTkButton(hdr2, text="Tümünü Gör →", font=("Segoe UI", 11),
+                  fg_color="transparent", text_color="#e67e22",
+                  hover_color="#2f3640", border_width=0,
+                  command=goster_tum_galeri).pack(side="right")
+
+    son_urunler = _son_eklenen_urunler(16)
+    if son_urunler:
+        thumb_frame = ctk.CTkScrollableFrame(son_card, fg_color="transparent",
+                                             height=215, orientation="horizontal")
+        thumb_frame.pack(fill="x", padx=10, pady=(0, 12))
+        for u in son_urunler:
+            _urun_thumb_kart(thumb_frame, u)
+    else:
+        ctk.CTkLabel(son_card, text="Henüz tarama yapılmadı veya yeni ürün yok.",
+                     font=("Segoe UI", 13), text_color="#636e72").pack(pady=25)
+
+    # ─── Marka Kartları Izgara ───
+    kartlar_baslik = ctk.CTkFrame(dash_scroll, fg_color="transparent")
+    kartlar_baslik.pack(fill="x", padx=15, pady=(5, 0))
+    ctk.CTkLabel(kartlar_baslik, text="Marka Durumları",
+                 font=("Segoe UI", 13, "bold"), text_color="white").pack(side="left")
+
     if not bot_durumu["marka_durumlari"]:
-        ctk.CTkLabel(dash_scroll, text="Henüz tarama yapılmadı. 'Hemen Çalıştır' butonuna tıklayın.", font=("Segoe UI", 16), text_color="#7f8c8d").pack(pady=60)
+        ctk.CTkLabel(dash_scroll, text="Hemen Çalıştır butonuna tıklayın.",
+                     font=("Segoe UI", 14), text_color="#7f8c8d").pack(pady=20)
         return
+
+    grid_f = ctk.CTkFrame(dash_scroll, fg_color="transparent")
+    grid_f.pack(fill="x", padx=15, pady=(5, 15))
     for i in range(5):
-        dash_scroll.grid_columnconfigure(i, weight=1)
+        grid_f.grid_columnconfigure(i, weight=1)
+
     row, col = 0, 0
     for marka in MARKALAR:
         ad = marka["ad"]
@@ -1785,21 +1939,26 @@ def guncelle_dashboard_kartlari():
         yeni_say = durum.get("yeni", 0)
         hata = durum.get("hata", "")
         renk = CINSIYET_RENK.get(cinsiyet, "#888")
-        card = ctk.CTkFrame(dash_scroll, fg_color="#1e272e", corner_radius=12, border_width=2,
-                            border_color=renk if not hata else "#e74c3c", cursor="hand2")
-        card.grid(row=row, column=col, padx=8, pady=8, sticky="nsew")
-        lbl_ad    = ctk.CTkLabel(card, text=ad[:22], font=("Segoe UI", 11, "bold"), text_color="white", wraplength=180, cursor="hand2")
-        lbl_ad.pack(padx=10, pady=(10, 2))
-        lbl_say   = ctk.CTkLabel(card, text=f"{urun_say} ürün", font=("Segoe UI", 20, "bold"), text_color="white", cursor="hand2")
-        lbl_say.pack(padx=10)
+        card = ctk.CTkFrame(grid_f, fg_color="#1e272e", corner_radius=10,
+                            border_width=2, border_color=renk if not hata else "#e74c3c",
+                            cursor="hand2")
+        card.grid(row=row, column=col, padx=6, pady=6, sticky="nsew")
+        lbl_ad = ctk.CTkLabel(card, text=ad[:22], font=("Segoe UI", 10, "bold"),
+                              text_color="white", wraplength=170, cursor="hand2")
+        lbl_ad.pack(padx=8, pady=(8, 1))
+        lbl_say = ctk.CTkLabel(card, text=f"{urun_say} ürün",
+                               font=("Segoe UI", 18, "bold"), text_color="white", cursor="hand2")
+        lbl_say.pack(padx=8)
         if hata:
-            lbl_alt = ctk.CTkLabel(card, text=f"❌ {hata[:30]}", font=("Segoe UI", 9), text_color="#e74c3c", cursor="hand2")
+            lbl_alt = ctk.CTkLabel(card, text=f"❌ {hata[:28]}", font=("Segoe UI", 8),
+                                   text_color="#e74c3c", cursor="hand2")
         elif yeni_say > 0:
-            lbl_alt = ctk.CTkLabel(card, text=f"🆕 {yeni_say} yeni", font=("Segoe UI", 12, "bold"), text_color="#2ecc71", cursor="hand2")
+            lbl_alt = ctk.CTkLabel(card, text=f"🆕 {yeni_say} yeni",
+                                   font=("Segoe UI", 11, "bold"), text_color="#2ecc71", cursor="hand2")
         else:
-            lbl_alt = ctk.CTkLabel(card, text="— yeni yok", font=("Segoe UI", 10), text_color="#7f8c8d", cursor="hand2")
-        lbl_alt.pack(padx=10, pady=(0, 8))
-        # Tıklanabilir — her widget'a bind
+            lbl_alt = ctk.CTkLabel(card, text="— yeni yok", font=("Segoe UI", 9),
+                                   text_color="#7f8c8d", cursor="hand2")
+        lbl_alt.pack(padx=8, pady=(0, 7))
         for widget in (card, lbl_ad, lbl_say, lbl_alt):
             widget.bind("<Button-1>", lambda e, brand=ad: goster_marka_detay(brand))
         col += 1
