@@ -1,0 +1,2182 @@
+"""
+Multi-Brand New In Bot v16 — Desktop GUI + Gemini AI Edition
+═════════════════════════════════════════════════════════════
+v14 çalışan motor (birebir) + CustomTkinter GUI + Google Gemini AI
+"""
+
+import asyncio
+from playwright.async_api import async_playwright
+from datetime import datetime, time as dtime
+import os, requests, json, re, time, io, csv, sys
+import threading, webbrowser
+from difflib import SequenceMatcher
+from zoneinfo import ZoneInfo
+
+# ── GUI kütüphaneleri ──
+try:
+    import customtkinter as ctk
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+except ImportError:
+    print("customtkinter bulunamadı: pip install customtkinter")
+    sys.exit(1)
+
+import tkinter as tk
+from tkinter import messagebox, filedialog
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.utils import get_column_letter
+from PIL import Image as PILImage
+
+# ══════════════════════════════════════════════════════════════
+# BÖLÜM 1 — SABİTLER (v14 birebir)
+# ══════════════════════════════════════════════════════════════
+
+ISTANBUL_TZ      = ZoneInfo("Europe/Istanbul")
+CALISMA_SAATLERI = [dtime(11, 52), dtime(14, 50), dtime(16, 6)]
+
+WEBHOOKS = {
+    "kadin": "https://chat.googleapis.com/v1/spaces/AAQASayNaIA/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=hRXWblsuLLQ7brv60rGxJMLQ0A5lh4rjFA0RjH2Mha0",
+    "erkek": "https://chat.googleapis.com/v1/spaces/AAQA_FnAImw/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=5eZ7k2DSLlxD3c6jYGdEqIEqhXuq5_VpzEnTiEMt0Ps",
+    "cocuk": "https://chat.googleapis.com/v1/spaces/AAQAMVf1Hi0/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=CC8N_h1wWLe-T64b6l2C4bm4_Jh-z1CgnREIAlXcNVE",
+}
+
+# ── Gemini AI API ──
+GEMINI_API_KEY = ""   # Google AI Studio'dan alınan key
+GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+CACHE_FILE = "seen_products.json"
+HAFTALIK_DOSYA = "haftalik_tarih.json"
+EXCEL_DIR  = "outputs"
+EXCEL_FILE = os.path.join(EXCEL_DIR, "yeni_urunler_log.xlsx")
+
+EXCEL_COLS = [
+    ("Tur",        8),  ("Tarih",      18), ("Marka",      28),
+    ("Ülke",       14), ("Cinsiyet",   10), ("Ürün Adı",   40),
+    ("Fiyat",      14), ("Link",       55), ("Görsel URL", 55),
+    ("Görsel",     18),
+]
+GORSEL_SATIR_YUKSEK = 80
+
+ULKE_HARITA = {
+    "🇹🇷": "Türkiye", "🇪🇸": "İspanya", "🇯🇵": "Japonya",
+    "🇰🇷": "Güney Kore", "🇪🇬": "Mısır", "🇪🇺": "Avrupa",
+    "🇨🇦": "Kanada", "🇵🇱": "Polonya", "🇷🇴": "Romanya", "🌍": "Global",
+}
+
+def ulke_bul(marka_ad: str) -> str:
+    for emoji, ulke in ULKE_HARITA.items():
+        if emoji in marka_ad:
+            return ulke
+    return "Bilinmiyor"
+
+# Global GUI durum
+bot_durumu = {
+    "calisiyor": False, "son_tur": 0,
+    "son_guncelleme": "Hiç çalışmadı",
+    "toplam_yeni": {"kadin": 0, "erkek": 0, "cocuk": 0, "defacto": 0},
+    "marka_durumlari": {},
+    "benzerlik_sonuclari": [],
+    "log_satirlari": [],
+    "ai_sonuc": "",
+    "urun_listesi": {},   # marka_ad → ürün listesi (dashboard detay için)
+    "son_eklenenler": [],  # Son eklenen ürünler [{isim,fiyat,link,gorsel,marka_ad}]
+}
+
+
+_IMG_SEM = threading.Semaphore(8)  # max 8 eş zamanlı resim indirme
+
+# ── Marka listesi (v14 birebir — TÜM ülkeler dahil) ───────
+MARKALAR = [
+    # ═══ ZARA KADIN ═══
+    {"ad":"👗 Zara Kadın 🇹🇷","url":"https://www.zara.com/tr/tr/kadin-yeni-l1180.html?v1=2546081","tum_link":"https://www.zara.com/tr/tr/kadin-yeni-l1180.html?v1=2546081","locale":"tr-TR","tz":"Europe/Istanbul","tip":"zara","cinsiyet":"kadin"},
+    {"ad":"👗 Zara Kadın 🇪🇸","url":"https://www.zara.com/es/es/mujer-nuevo-l1180.html?v1=2546081","tum_link":"https://www.zara.com/es/es/mujer-nuevo-l1180.html?v1=2546081","locale":"es-ES","tz":"Europe/Madrid","tip":"zara","cinsiyet":"kadin"},
+    {"ad":"👗 Zara Kadın 🇯🇵","url":"https://www.zara.com/jp/ja/woman-new-in-l1180.html?v1=2546081","tum_link":"https://www.zara.com/jp/ja/woman-new-in-l1180.html?v1=2546081","locale":"ja-JP","tz":"Asia/Tokyo","tip":"zara","cinsiyet":"kadin"},
+    {"ad":"👗 Zara Kadın 🇰🇷","url":"https://www.zara.com/kr/ko/woman-new-in-l1180.html?v1=2546081","tum_link":"https://www.zara.com/kr/ko/woman-new-in-l1180.html?v1=2546081","locale":"ko-KR","tz":"Asia/Seoul","tip":"zara","cinsiyet":"kadin"},
+    {"ad":"👗 Zara Kadın 🇪🇬","url":"https://www.zara.com/eg/en/woman-new-in-l1180.html?v1=2546081","tum_link":"https://www.zara.com/eg/en/woman-new-in-l1180.html?v1=2546081","locale":"en-US","tz":"Africa/Cairo","tip":"zara","cinsiyet":"kadin"},
+    # ═══ ZARA ERKEK ═══
+    {"ad":"👔 Zara Erkek 🇹🇷","url":"https://www.zara.com/tr/tr/erkek-yeni-l737.html?v1=2314979","tum_link":"https://www.zara.com/tr/tr/erkek-yeni-l737.html?v1=2314979","locale":"tr-TR","tz":"Europe/Istanbul","tip":"zara","cinsiyet":"erkek"},
+    {"ad":"👔 Zara Erkek 🇪🇸","url":"https://www.zara.com/es/es/hombre-nuevo-l737.html?v1=2314979","tum_link":"https://www.zara.com/es/es/hombre-nuevo-l737.html?v1=2314979","locale":"es-ES","tz":"Europe/Madrid","tip":"zara","cinsiyet":"erkek"},
+    {"ad":"👔 Zara Erkek 🇯🇵","url":"https://www.zara.com/jp/ja/man-new-in-l737.html?v1=2314979","tum_link":"https://www.zara.com/jp/ja/man-new-in-l737.html?v1=2314979","locale":"ja-JP","tz":"Asia/Tokyo","tip":"zara","cinsiyet":"erkek"},
+    {"ad":"👔 Zara Erkek 🇰🇷","url":"https://www.zara.com/kr/ko/man-new-in-l737.html?v1=2314979","tum_link":"https://www.zara.com/kr/ko/man-new-in-l737.html?v1=2314979","locale":"ko-KR","tz":"Asia/Seoul","tip":"zara","cinsiyet":"erkek"},
+    {"ad":"👔 Zara Erkek 🇪🇬","url":"https://www.zara.com/eg/en/man-new-in-l737.html?v1=2314979","tum_link":"https://www.zara.com/eg/en/man-new-in-l737.html?v1=2314979","locale":"en-US","tz":"Africa/Cairo","tip":"zara","cinsiyet":"erkek"},
+    # ═══ ZARA ÇOCUK / BEBEK (tüm ülkeler) ═══
+    {"ad":"👧 Zara Kız Çocuk 🇹🇷","url":"https://www.zara.com/tr/tr/chocuklar-kiz-chocuk-yeni-gelenler-l391.html?v1=2637283","tum_link":"https://www.zara.com/tr/tr/chocuklar-kiz-chocuk-yeni-gelenler-l391.html?v1=2637283","locale":"tr-TR","tz":"Europe/Istanbul","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"👧 Zara Kız Çocuk 🇪🇸","url":"https://www.zara.com/es/es/ninas-nuevo-l391.html?v1=2637283","tum_link":"https://www.zara.com/es/es/ninas-nuevo-l391.html?v1=2637283","locale":"es-ES","tz":"Europe/Madrid","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"👧 Zara Kız Çocuk 🇯🇵","url":"https://www.zara.com/jp/ja/girl-new-in-l391.html?v1=2637283","tum_link":"https://www.zara.com/jp/ja/girl-new-in-l391.html?v1=2637283","locale":"ja-JP","tz":"Asia/Tokyo","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"👧 Zara Kız Çocuk 🇰🇷","url":"https://www.zara.com/kr/ko/girl-new-in-l391.html?v1=2637283","tum_link":"https://www.zara.com/kr/ko/girl-new-in-l391.html?v1=2637283","locale":"ko-KR","tz":"Asia/Seoul","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"👧 Zara Kız Çocuk 🇪🇬","url":"https://www.zara.com/eg/en/girl-new-in-l391.html?v1=2637283","tum_link":"https://www.zara.com/eg/en/girl-new-in-l391.html?v1=2637283","locale":"en-US","tz":"Africa/Cairo","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"👦 Zara Erkek Çocuk 🇹🇷","url":"https://www.zara.com/tr/tr/chocuklar-erkek-chocuk-yeni-gelenler-l228.html?v1=2636283","tum_link":"https://www.zara.com/tr/tr/chocuklar-erkek-chocuk-yeni-gelenler-l228.html?v1=2636283","locale":"tr-TR","tz":"Europe/Istanbul","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"👦 Zara Erkek Çocuk 🇪🇸","url":"https://www.zara.com/es/es/ninos-nuevo-l228.html?v1=2636283","tum_link":"https://www.zara.com/es/es/ninos-nuevo-l228.html?v1=2636283","locale":"es-ES","tz":"Europe/Madrid","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"👦 Zara Erkek Çocuk 🇯🇵","url":"https://www.zara.com/jp/ja/boy-new-in-l228.html?v1=2636283","tum_link":"https://www.zara.com/jp/ja/boy-new-in-l228.html?v1=2636283","locale":"ja-JP","tz":"Asia/Tokyo","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"👦 Zara Erkek Çocuk 🇰🇷","url":"https://www.zara.com/kr/ko/boy-new-in-l228.html?v1=2636283","tum_link":"https://www.zara.com/kr/ko/boy-new-in-l228.html?v1=2636283","locale":"ko-KR","tz":"Asia/Seoul","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"👦 Zara Erkek Çocuk 🇪🇬","url":"https://www.zara.com/eg/en/boy-new-in-l228.html?v1=2636283","tum_link":"https://www.zara.com/eg/en/boy-new-in-l228.html?v1=2636283","locale":"en-US","tz":"Africa/Cairo","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"🎀 Zara Kız Bebek 🇹🇷","url":"https://www.zara.com/tr/tr/chocuklar-kiz-bebek-yeni-gelenler-l127.html?v1=2635794","tum_link":"https://www.zara.com/tr/tr/chocuklar-kiz-bebek-yeni-gelenler-l127.html?v1=2635794","locale":"tr-TR","tz":"Europe/Istanbul","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"🎀 Zara Kız Bebek 🇪🇸","url":"https://www.zara.com/es/es/bebe-nina-nuevo-l127.html?v1=2635794","tum_link":"https://www.zara.com/es/es/bebe-nina-nuevo-l127.html?v1=2635794","locale":"es-ES","tz":"Europe/Madrid","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"🎀 Zara Kız Bebek 🇯🇵","url":"https://www.zara.com/jp/ja/baby-girl-new-in-l127.html?v1=2635794","tum_link":"https://www.zara.com/jp/ja/baby-girl-new-in-l127.html?v1=2635794","locale":"ja-JP","tz":"Asia/Tokyo","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"🎀 Zara Kız Bebek 🇰🇷","url":"https://www.zara.com/kr/ko/baby-girl-new-in-l127.html?v1=2635794","tum_link":"https://www.zara.com/kr/ko/baby-girl-new-in-l127.html?v1=2635794","locale":"ko-KR","tz":"Asia/Seoul","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"🎀 Zara Kız Bebek 🇪🇬","url":"https://www.zara.com/eg/en/baby-girl-new-in-l127.html?v1=2635794","tum_link":"https://www.zara.com/eg/en/baby-girl-new-in-l127.html?v1=2635794","locale":"en-US","tz":"Africa/Cairo","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"🧸 Zara Erkek Bebek 🇹🇷","url":"https://www.zara.com/tr/tr/chocuklar-erkek-bebek-yeni-gelenler-l43.html?v1=2637284","tum_link":"https://www.zara.com/tr/tr/chocuklar-erkek-bebek-yeni-gelenler-l43.html?v1=2637284","locale":"tr-TR","tz":"Europe/Istanbul","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"🧸 Zara Erkek Bebek 🇪🇸","url":"https://www.zara.com/es/es/bebe-nino-nuevo-l43.html?v1=2637284","tum_link":"https://www.zara.com/es/es/bebe-nino-nuevo-l43.html?v1=2637284","locale":"es-ES","tz":"Europe/Madrid","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"🧸 Zara Erkek Bebek 🇯🇵","url":"https://www.zara.com/jp/ja/baby-boy-new-in-l43.html?v1=2637284","tum_link":"https://www.zara.com/jp/ja/baby-boy-new-in-l43.html?v1=2637284","locale":"ja-JP","tz":"Asia/Tokyo","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"🧸 Zara Erkek Bebek 🇰🇷","url":"https://www.zara.com/kr/ko/baby-boy-new-in-l43.html?v1=2637284","tum_link":"https://www.zara.com/kr/ko/baby-boy-new-in-l43.html?v1=2637284","locale":"ko-KR","tz":"Asia/Seoul","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"🧸 Zara Erkek Bebek 🇪🇬","url":"https://www.zara.com/eg/en/baby-boy-new-in-l43.html?v1=2637284","tum_link":"https://www.zara.com/eg/en/baby-boy-new-in-l43.html?v1=2637284","locale":"en-US","tz":"Africa/Cairo","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"🍼 Zara Bebek 🇹🇷","url":"https://www.zara.com/tr/tr/cocuk-bebek-yeniler-l7218.html?v1=2636284","tum_link":"https://www.zara.com/tr/tr/cocuk-bebek-yeniler-l7218.html?v1=2636284","locale":"tr-TR","tz":"Europe/Istanbul","tip":"zara","cinsiyet":"cocuk"},
+    {"ad":"🍼 Zara Bebek 🇪🇸","url":"https://www.zara.com/es/es/bebe-nuevo-l7218.html?v1=2636284","tum_link":"https://www.zara.com/es/es/bebe-nuevo-l7218.html?v1=2636284","locale":"es-ES","tz":"Europe/Madrid","tip":"zara","cinsiyet":"cocuk"},
+    # ═══ MASSIMO DUTTI ═══
+    {"ad":"🧣 MD Kadın 🇹🇷","url":"https://www.massimodutti.com/tr/kadin/yenilik-n1474","tum_link":"https://www.massimodutti.com/tr/kadin/yenilik-n1474","locale":"tr-TR","tz":"Europe/Istanbul","tip":"inditex","cinsiyet":"kadin"},
+    {"ad":"🧣 MD Kadın 🇪🇸","url":"https://www.massimodutti.com/es/mujer/novedades-n1474","tum_link":"https://www.massimodutti.com/es/mujer/novedades-n1474","locale":"es-ES","tz":"Europe/Madrid","tip":"inditex","cinsiyet":"kadin"},
+    {"ad":"🧣 MD Erkek 🇹🇷","url":"https://www.massimodutti.com/tr/erkek/yenilik-n1396","tum_link":"https://www.massimodutti.com/tr/erkek/yenilik-n1396","locale":"tr-TR","tz":"Europe/Istanbul","tip":"inditex","cinsiyet":"erkek"},
+    {"ad":"🧣 MD Erkek 🇪🇸","url":"https://www.massimodutti.com/es/hombre/novedades-n1396","tum_link":"https://www.massimodutti.com/es/hombre/novedades-n1396","locale":"es-ES","tz":"Europe/Madrid","tip":"inditex","cinsiyet":"erkek"},
+    # ═══ STRADIVARIUS ═══
+    {"ad":"🌸 Stradivarius 🇹🇷","url":"https://www.stradivarius.com/tr/kadin/yeni-n5564","tum_link":"https://www.stradivarius.com/tr/kadin/yeni-n5564","locale":"tr-TR","tz":"Europe/Istanbul","tip":"stradivarius","cinsiyet":"kadin"},
+    {"ad":"🌸 Stradivarius 🇪🇸","url":"https://www.stradivarius.com/es/mujer/novedades-n5564","tum_link":"https://www.stradivarius.com/es/mujer/novedades-n5564","locale":"es-ES","tz":"Europe/Madrid","tip":"stradivarius","cinsiyet":"kadin"},
+    {"ad":"🌸 Stradivarius 🇵🇱","url":"https://www.stradivarius.com/pl/woman/new-in-n5564","tum_link":"https://www.stradivarius.com/pl/woman/new-in-n5564","locale":"pl-PL","tz":"Europe/Warsaw","tip":"stradivarius","cinsiyet":"kadin"},
+    {"ad":"🌸 Stradivarius 🇷🇴","url":"https://www.stradivarius.com/ro/woman/new-in-n5564","tum_link":"https://www.stradivarius.com/ro/woman/new-in-n5564","locale":"ro-RO","tz":"Europe/Bucharest","tip":"stradivarius","cinsiyet":"kadin"},
+    # ═══ BERSHKA ═══
+    {"ad":"🎯 Bershka Kadın 🇹🇷","url":"https://www.bershka.com/tr/kadin/yeni-n3283.html","tum_link":"https://www.bershka.com/tr/kadin/yeni-n3283.html","locale":"tr-TR","tz":"Europe/Istanbul","tip":"inditex","cinsiyet":"kadin"},
+    {"ad":"🎯 Bershka Erkek 🇹🇷","url":"https://www.bershka.com/tr/erkek/yeni-n3745.html","tum_link":"https://www.bershka.com/tr/erkek/yeni-n3745.html","locale":"tr-TR","tz":"Europe/Istanbul","tip":"inditex","cinsiyet":"erkek"},
+    {"ad":"🎯 Bershka Kadın 🇪🇸","url":"https://www.bershka.com/es/mujer/novedades-n3283.html","tum_link":"https://www.bershka.com/es/mujer/novedades-n3283.html","locale":"es-ES","tz":"Europe/Madrid","tip":"inditex","cinsiyet":"kadin"},
+    {"ad":"🎯 Bershka Erkek 🇪🇸","url":"https://www.bershka.com/es/hombre/novedades-n3745.html","tum_link":"https://www.bershka.com/es/hombre/novedades-n3745.html","locale":"es-ES","tz":"Europe/Madrid","tip":"inditex","cinsiyet":"erkek"},
+    {"ad":"🎯 Bershka Kadın 🇪🇬","url":"https://www.bershka.com/eg/women/new-n3283.html","tum_link":"https://www.bershka.com/eg/women/new-n3283.html","locale":"en-US","tz":"Africa/Cairo","tip":"inditex","cinsiyet":"kadin"},
+    {"ad":"🎯 Bershka Erkek 🇪🇬","url":"https://www.bershka.com/eg/men/new-n3745.html","tum_link":"https://www.bershka.com/eg/men/new-n3745.html","locale":"en-US","tz":"Africa/Cairo","tip":"inditex","cinsiyet":"erkek"},
+    {"ad":"🎯 Bershka Kadın 🌍","url":"https://www.bershka.com/ww/women/new-n3283.html","tum_link":"https://www.bershka.com/ww/women/new-n3283.html","locale":"en-US","tz":"Europe/London","tip":"inditex","cinsiyet":"kadin"},
+    {"ad":"🎯 Bershka Erkek 🌍","url":"https://www.bershka.com/ww/men/new-n3745.html","tum_link":"https://www.bershka.com/ww/men/new-n3745.html","locale":"en-US","tz":"Europe/London","tip":"inditex","cinsiyet":"erkek"},
+    # ═══ YSL ═══
+    {"ad":"🖤 YSL Kadın RTW","url":"https://www.ysl.com/en-en/ca/shop-women/ready-to-wear","tum_link":"https://www.ysl.com/en-en/ca/shop-women/ready-to-wear","locale":"en-US","tz":"Europe/Paris","tip":"ysl","cinsiyet":"kadin"},
+    # ═══ UNIQLO ═══
+    {"ad":"🔴 Uniqlo Kadın 🇪🇺","url":"https://www.uniqlo.com/eu-at/en/feature/new/women","tum_link":"https://www.uniqlo.com/eu-at/en/feature/new/women","locale":"en-US","tz":"Europe/Vienna","tip":"uniqlo","cinsiyet":"kadin"},
+    {"ad":"🔴 Uniqlo Erkek 🇪🇺","url":"https://www.uniqlo.com/eu-at/en/feature/new/men","tum_link":"https://www.uniqlo.com/eu-at/en/feature/new/men","locale":"en-US","tz":"Europe/Vienna","tip":"uniqlo","cinsiyet":"erkek"},
+    {"ad":"🔴 Uniqlo Çocuk 🇪🇺","url":"https://www.uniqlo.com/eu-at/en/feature/new/kids","tum_link":"https://www.uniqlo.com/eu-at/en/feature/new/kids","locale":"en-US","tz":"Europe/Vienna","tip":"uniqlo","cinsiyet":"cocuk"},
+    # ═══ ARİTZİA ═══
+    {"ad":"🍁 Aritzia Kadın 🇨🇦","url":"https://www.aritzia.com/en/clothing/new-arrivals","tum_link":"https://www.aritzia.com/en/clothing/new-arrivals","locale":"en-CA","tz":"America/Toronto","tip":"aritzia","cinsiyet":"kadin"},
+    # ═══ BRANDY MELVILLE ═══
+    {"ad":"🌺 Brandy Melville 🇪🇺","url":"https://eu.brandymelville.com/collections/new-arrivals","tum_link":"https://eu.brandymelville.com/collections/new-arrivals","locale":"en-US","tz":"Europe/London","tip":"shopify","cinsiyet":"kadin"},
+    # ═══ DEFACTO ═══
+    {"ad":"🍎 Defacto En Yeni",       "url":"https://www.defacto.com.tr/app/en-yeni-urunler",                              "tum_link":"https://www.defacto.com.tr/app/en-yeni-urunler",                              "locale":"tr-TR","tz":"Europe/Istanbul","tip":"defacto","cinsiyet":"kadin","defacto_kategori":"Kadın"},
+    {"ad":"🍎 Defacto Love New Erkek","url":"https://www.defacto.com.tr/app/love-the-new-erkek",                           "tum_link":"https://www.defacto.com.tr/app/love-the-new-erkek",                           "locale":"tr-TR","tz":"Europe/Istanbul","tip":"defacto","cinsiyet":"erkek","defacto_kategori":"Erkek"},
+    {"ad":"🍎 Defacto Yeniler Çocuk", "url":"https://www.defacto.com.tr/yeniler-cocuk-giyim",                              "tum_link":"https://www.defacto.com.tr/yeniler-cocuk-giyim",                              "locale":"tr-TR","tz":"Europe/Istanbul","tip":"defacto","cinsiyet":"cocuk","defacto_kategori":"Çocuk"},
+    {"ad":"🍎 Defacto Fit Kadın",     "url":"https://www.defacto.com.tr/app/fit-yeni-sezon-tum-gun?filtre=cinsiyet:kadin", "tum_link":"https://www.defacto.com.tr/app/fit-yeni-sezon-tum-gun?filtre=cinsiyet:kadin", "locale":"tr-TR","tz":"Europe/Istanbul","tip":"defacto","cinsiyet":"kadin","defacto_kategori":"Kadın"},
+    {"ad":"🍎 Defacto Fit Erkek",     "url":"https://www.defacto.com.tr/app/fit-yeni-sezon-tum-gun?filtre=cinsiyet:erkek", "tum_link":"https://www.defacto.com.tr/app/fit-yeni-sezon-tum-gun?filtre=cinsiyet:erkek", "locale":"tr-TR","tz":"Europe/Istanbul","tip":"defacto","cinsiyet":"erkek","defacto_kategori":"Erkek"},
+]
+
+
+# ══════════════════════════════════════════════════════════════
+# BÖLÜM 2 — KATEGORİ + BENZERLİK (v14 birebir)
+# ══════════════════════════════════════════════════════════════
+
+KATEGORI_SOZLUK = {
+    "pantolon": ["pantolon","pant","pants","trouser","trousers","jogger","joggers",
+                 "cargo","chino","chinos","jeans","denim","legging","leggings",
+                 "tayt","palazzo","culotte","bermuda","şort","short","shorts",
+                 "pantalon","pantalones","vaquero","vaqueros","paraşüt","baggy"],
+    "ust":      ["tshirt","t-shirt","tee","top","bluz","blouse","gömlek","shirt",
+                 "camisa","camiseta","body","bodysuit","tank","atlet","polo",
+                 "sweatshirt","hoodie","kazak","knitwear","triko","sweater",
+                 "pullover","cardigan","ceket","jacket","mont","coat","blazer",
+                 "yelek","vest","tunik","tunic","crop","bolero","pelerin"],
+    "elbise":   ["elbise","dress","robe","vestido","midi","maxi","mini",
+                 "tulum","jumpsuit","overall","salopette"],
+    "etek":     ["etek","skirt","jupe","gonna","falda","pareo"],
+    "ayakkabi": ["ayakkabı","shoe","shoes","sneaker","sneakers","bot","boots",
+                 "sandal","sandals","loafer","loafers","moccasin","espadrille",
+                 "zapato","zapatos","barefoot","takunya","terlik","babet","topuklu"],
+    "aksesuar": ["çanta","bag","bags","bolso","şapka","hat","cap","gorro","bere",
+                 "scarf","eşarp","kemer","belt","cüzdan","wallet","kolye","necklace",
+                 "küpe","earring","bileklik","bracelet","güneş gözlüğü","sunglasses",
+                 "anahtarlık","keychain","charm"],
+    "ic_giyim": ["iç çamaşır","underwear","boxer","brief","sütyen","bra","külot",
+                 "çorap","socks","sock","pijama","pyjama","gecelik","bikini","mayo",
+                 "swimwear","bandeau","bodice"],
+    "spor":     ["spor","sport","sports","gym","yoga","training","atletik",
+                 "athletic","running","koşu","fitness"],
+}
+
+def _kategori_bul(isim: str) -> str:
+    s = isim.lower()
+    s = re.sub(r'[^a-zçğışöü\s]', ' ', s)
+    for kat, kelimeler in KATEGORI_SOZLUK.items():
+        if any(k in s for k in kelimeler):
+            return kat
+    return "diger"
+
+def _normalize(isim: str) -> str:
+    s = isim.lower()
+    s = re.sub(r'\b(p\d{6,}|l\d{4,}|n\d{4,}|c\d{4,})\b', '', s)
+    s = re.sub(r'[^a-zçğışöü\s]', ' ', s)
+    s = re.sub(r'\b\w\b', '', s)
+    return ' '.join(s.split())
+
+def benzerlik_skoru(a: str, b: str) -> float:
+    na, nb = _normalize(a), _normalize(b)
+    if not na or not nb: return 0.0
+    return SequenceMatcher(None, na, nb).ratio()
+
+def benzer_urunleri_bul(defacto_urunler, hedef_urunler, esik=0.62):
+    ALT_GRUPLAR = {"pantolon", "etek", "elbise"}
+    UST_GRUPLAR = {"ust"}
+    IZOLE       = {"ayakkabi", "aksesuar", "ic_giyim"}
+    eslesler = []
+    for du in defacto_urunler:
+        d_isim = du.get("isim", ""); d_kat = _kategori_bul(d_isim)
+        en_iyi, en_skor = None, 0
+        for zu in hedef_urunler:
+            z_isim = zu.get("isim", ""); z_kat = _kategori_bul(z_isim)
+            if d_kat != z_kat:
+                if not (d_kat == "diger" or z_kat == "diger"): continue
+            if (d_kat in ALT_GRUPLAR and z_kat in UST_GRUPLAR) or \
+               (d_kat in UST_GRUPLAR and z_kat in ALT_GRUPLAR): continue
+            if d_kat in IZOLE and z_kat not in {d_kat, "diger"}: continue
+            pid_d = re.search(r'[pP](\d{8,})', du.get("link",""))
+            pid_z = re.search(r'[pP](\d{8,})', zu.get("link",""))
+            if pid_d and pid_z and pid_d.group(1) == pid_z.group(1):
+                en_iyi, en_skor = zu, 1.0; break
+            skor = benzerlik_skoru(d_isim, z_isim)
+            if skor > en_skor: en_skor, en_iyi = skor, zu
+        if en_iyi and en_skor >= esik: eslesler.append((du, en_iyi, en_skor))
+    return eslesler
+
+
+# ══════════════════════════════════════════════════════════════
+# BÖLÜM 3 — CACHE / WEBHOOK / EXCEL (v14 birebir)
+# ══════════════════════════════════════════════════════════════
+
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, encoding="utf-8") as f:
+                return json.load(f).get("markalar", {})
+        except: pass
+    return {}
+
+def cache_linkler(v):
+    if isinstance(v, list): return set(v)
+    return set(v.get("linkler", []))
+
+def cache_urunler(v):
+    if isinstance(v, dict): return v.get("urunler", [])
+    return []
+
+def save_cache(d):
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"markalar": d, "son_guncelleme": datetime.now().isoformat()}, f, ensure_ascii=False, indent=2)
+
+
+def haftalik_yukle() -> dict:
+    """Haftalık yeni ürün geçmişini yükle: {ISO-hafta → toplam_yeni}"""
+    if os.path.exists(HAFTALIK_DOSYA):
+        try:
+            with open(HAFTALIK_DOSYA, encoding="utf-8") as f:
+                return json.load(f)
+        except: pass
+    return {}
+
+
+def haftalik_kaydet(yeni_sayisi: int):
+    """Bu haftanın verisi güncelle."""
+    veri = haftalik_yukle()
+    hafta_no = datetime.now().isocalendar()[1]
+    yil = datetime.now().year
+    anahtar = f"{yil}-W{hafta_no:02d}"
+    veri[anahtar] = veri.get(anahtar, 0) + yeni_sayisi
+    # Son 16 haftayı sakla
+    anahtarlar = sorted(veri.keys())[-16:]
+    veri = {k: veri[k] for k in anahtarlar}
+    try:
+        with open(HAFTALIK_DOSYA, "w", encoding="utf-8") as f:
+            json.dump(veri, f, ensure_ascii=False, indent=2)
+    except: pass
+
+def webhook(cinsiyet): return WEBHOOKS.get(cinsiyet, WEBHOOKS["kadin"])
+
+def post(url, payload):
+    try:
+        r = requests.post(url, json=payload, headers={"Content-Type":"application/json"}, timeout=30)
+        return r.status_code
+    except Exception as e:
+        log(f"  ⚠️ POST hatası: {e}")
+        return 0
+
+def marka_adi(ad):
+    for isim in ["Zara","Defacto","Massimo Dutti","MD","Stradivarius","Bershka","YSL","Uniqlo","Aritzia","Brandy"]:
+        if isim.lower() in ad.lower(): return isim
+    return ad
+
+
+# ── EXCEL MODÜLÜ (v14 birebir) ──
+HEADER_FILL = PatternFill("solid", start_color="1F3864", end_color="1F3864")
+HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+DATA_FONT   = Font(name="Arial", size=9)
+LINK_FONT   = Font(name="Arial", size=9, color="0563C1", underline="single")
+ALT_FILL    = PatternFill("solid", start_color="EEF2FF", end_color="EEF2FF")
+CENTER      = Alignment(horizontal="center", vertical="center", wrap_text=True)
+LEFT_WRAP   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+THIN_BORDER = Border(
+    left=Side(style="thin", color="CCCCCC"), right=Side(style="thin", color="CCCCCC"),
+    top=Side(style="thin", color="CCCCCC"),  bottom=Side(style="thin", color="CCCCCC"),
+)
+CINSIYET_RENKLER = {"kadin": "FCE4EC", "erkek": "E3F2FD", "cocuk": "F1F8E9"}
+
+def _excel_hazirla():
+    os.makedirs(EXCEL_DIR, exist_ok=True)
+    if os.path.exists(EXCEL_FILE): return
+    wb = Workbook(); ws = wb.active; ws.title = "Yeni Ürünler"
+    ws.freeze_panes = "A2"; ws.sheet_view.showGridLines = False
+    for col_idx, (baslik, genislik) in enumerate(EXCEL_COLS, start=1):
+        h = ws.cell(row=1, column=col_idx, value=baslik)
+        h.fill = HEADER_FILL; h.font = HEADER_FONT; h.alignment = CENTER; h.border = THIN_BORDER
+        ws.column_dimensions[get_column_letter(col_idx)].width = genislik
+    ws.row_dimensions[1].height = 22; wb.save(EXCEL_FILE)
+
+def _gorsel_indir(url, hedef_px=80):
+    if not url or not url.startswith("http"): return None
+    try:
+        resp = requests.get(url, timeout=10, headers={"User-Agent":"Mozilla/5.0"})
+        if resp.status_code != 200: return None
+        img = PILImage.open(io.BytesIO(resp.content)).convert("RGBA")
+        oran = hedef_px / img.height; yeni_w = max(1, int(img.width * oran))
+        img = img.resize((yeni_w, hedef_px), PILImage.LANCZOS)
+        buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0); return buf
+    except: return None
+
+def excel_tur_yaz(tur_no, tum_yeni_urunler):
+    if not tum_yeni_urunler: return
+    _excel_hazirla()
+    tarih_str = datetime.now(ISTANBUL_TZ).strftime("%d.%m.%Y %H:%M")
+    log(f"📊 Excel'e yazılıyor: {len(tum_yeni_urunler)} ürün")
+    wb = None
+    for deneme in range(3):
+        try: wb = load_workbook(EXCEL_FILE); break
+        except PermissionError:
+            log(f"  ⚠️ Excel kilitli, {3*(deneme+1)}sn bekleniyor...")
+            time.sleep(3*(deneme+1))
+    if wb is None: log("  ❌ Excel açılamadı"); return
+    ws = wb["Yeni Ürünler"]; basla = ws.max_row + 1
+    if basla == 2 and ws.cell(row=2, column=1).value is None: basla = 2
+    for i, kayit in enumerate(tum_yeni_urunler):
+        satir = basla + i; urun = kayit["urun"]; cinsiyet = kayit["cinsiyet"]
+        isim = urun.get("isim","").strip()[:100]; fiyat = urun.get("fiyat","").strip()[:30]
+        link = urun.get("link",""); gorsel = urun.get("gorsel",""); ulke = ulke_bul(kayit["marka_ad"])
+        c_renk = CINSIYET_RENKLER.get(cinsiyet, "FFFFFF")
+        alt_renk = ALT_FILL.start_color.rgb if (satir%2==0) else c_renk
+        satir_fill = PatternFill("solid", start_color=alt_renk, end_color=alt_renk)
+        for col_idx, deger in enumerate([tur_no, tarih_str, kayit["marka_ad"], ulke, cinsiyet, isim, fiyat, link, gorsel, ""], start=1):
+            h = ws.cell(row=satir, column=col_idx, value=deger)
+            h.border = THIN_BORDER; h.alignment = CENTER if col_idx in (1,4,5) else LEFT_WRAP
+            if col_idx in (8,9) and deger and deger.startswith("http"): h.hyperlink = deger; h.font = LINK_FONT
+            else: h.font = DATA_FONT
+            if col_idx != 10: h.fill = satir_fill
+        ws.row_dimensions[satir].height = GORSEL_SATIR_YUKSEK * 0.75
+        buf = _gorsel_indir(gorsel, hedef_px=GORSEL_SATIR_YUKSEK)
+        if buf:
+            try:
+                img_xl = XLImage(buf); img_xl.width = int(img_xl.width); img_xl.height = GORSEL_SATIR_YUKSEK
+                ws.add_image(img_xl, f"{get_column_letter(10)}{satir}")
+            except: pass
+    for deneme in range(3):
+        try: wb.save(EXCEL_FILE); log(f"✅ Excel güncellendi ({len(tum_yeni_urunler)} satır)"); return
+        except PermissionError: time.sleep(3*(deneme+1))
+    log("  ❌ Excel kaydedilemedi")
+
+
+# ── Google Chat Kartları (v14 birebir) ──
+def send_grup_karti(marka_ismi, gruplar, cinsiyet):
+    zaman = datetime.now().strftime('%d %B %Y — %H:%M')
+    toplam_yeni = sum(len(v["yeni"]) for v in gruplar.values())
+    sections = []
+    for ulke_ad, v in gruplar.items():
+        yeni, toplam, tum_link = v["yeni"], v["toplam"], v["tum_link"]
+        widgets = []
+        for u in yeni[:3]:
+            g = u.get("gorsel",""); l = u.get("link", tum_link)
+            isim = u.get("isim","").strip() or "Ürün"; fiyat = u.get("fiyat","").strip()
+            if g and g.startswith("http"):
+                widgets.append({"image": {"imageUrl": g, "onClick": {"openLink": {"url": l}}, "altText": isim[:60]}})
+            widgets.append({"decoratedText": {"text": f"<b>{isim[:60]}</b>","bottomLabel": fiyat[:30] if fiyat else "","button": {"text": "🔗 İncele", "onClick": {"openLink": {"url": l}}}}})
+        if len(yeni) > 3: widgets.append({"decoratedText": {"text": f"<b>+{len(yeni)-3} ürün daha</b>"}})
+        widgets.append({"buttonList": {"buttons": [{"text": f"🛒 Tümünü Gör ({toplam})", "onClick": {"openLink": {"url": tum_link}}}]}})
+        sections.append({"header": f"{ulke_ad}  ·  🆕 {len(yeni)} yeni", "collapsible": False, "widgets": widgets})
+    card = {"cardsV2": [{"cardId": marka_ismi, "card": {"header": {"title": marka_ismi, "subtitle": f"{zaman}  ·  🆕 {toplam_yeni} yeni ürün"}, "sections": sections}}]}
+    sc = post(webhook(cinsiyet), card)
+    log(f"  ✅ {marka_ismi} [{cinsiyet}]: {toplam_yeni} yeni → HTTP {sc}")
+
+def send_defacto_karti(marka_ad, yeni_urunler, toplam, tum_link, cinsiyet):
+    say = len(yeni_urunler); zaman = datetime.now().strftime('%d %B %Y — %H:%M')
+    widgets = []
+    for u in yeni_urunler[:5]:
+        g = u.get("gorsel",""); l = u.get("link", tum_link); isim = u.get("isim","Ürün").strip()[:60]; fiyat = u.get("fiyat","").strip()[:30]
+        if g and g.startswith("http"): widgets.append({"image": {"imageUrl": g, "onClick": {"openLink": {"url": l}}, "altText": isim}})
+        widgets.append({"decoratedText": {"text": f"<b>🆕 {isim}</b>","bottomLabel": fiyat,"button": {"text": "🔗 İncele", "onClick": {"openLink": {"url": l}}}}})
+    if say > 5: widgets.append({"decoratedText": {"text": f"<b>+{say-5} ürün daha...</b>"}})
+    widgets.append({"buttonList": {"buttons": [{"text": f"🛒 Tümünü Gör ({toplam})", "onClick": {"openLink": {"url": tum_link}}}]}})
+    card = {"cardsV2": [{"cardId": f"defacto_{marka_ad}", "card": {"header": {"title": marka_ad, "subtitle": f"{zaman}  ·  {toplam} ürün  ·  🆕 {say} yeni"}, "sections": [{"header": f"🆕 {say} Yeni Ürün", "collapsible": False, "widgets": widgets}]}}]}
+    sc = post(webhook(cinsiyet), card)
+    log(f"  ✅ {marka_ad} [{cinsiyet}]: {say} yeni (HTTP {sc})")
+
+def send_benzer_karti(eslesler, baslik, cinsiyet):
+    if not eslesler: return
+    zaman = datetime.now().strftime('%d %B %Y — %H:%M')
+    acil = sum(1 for _,_,s in eslesler if s >= 0.85)
+    KAT_EMOJI = {"pantolon":"👖","ust":"👕","elbise":"👗","etek":"🩱","ayakkabi":"👟","aksesuar":"👜","ic_giyim":"🩲","spor":"🏃","diger":"🏷️"}
+    sections = []
+    for du, zu, skor in eslesler[:8]:
+        if skor >= 0.95: etiket = "🟢 AYNI ÜRÜN"
+        elif skor >= 0.85: etiket = "🚨 ACİL"
+        elif skor >= 0.75: etiket = "🟡 Çok Benzer"
+        else: etiket = "🟠 Benzer"
+        d_kat = _kategori_bul(du.get("isim","")); kat_emoji = KAT_EMOJI.get(d_kat,"🏷️")
+        widgets = []
+        for pref, u in [("🍎 Defacto", du), ("🛍️ Diğer", zu)]:
+            g = u.get("gorsel",""); l = u.get("link","#"); isim = u.get("isim","Ürün").strip()[:60]; fiyat = u.get("fiyat","").strip()[:30]
+            if g and g.startswith("http"): widgets.append({"image": {"imageUrl": g, "onClick": {"openLink": {"url": l}}, "altText": f"{pref}: {isim}"}})
+            widgets.append({"decoratedText": {"startIcon": {"knownIcon": "BOOKMARK" if "Defacto" in pref else "STORE"},"text": f"<b>{pref}</b>","bottomLabel": f"{isim}  |  {fiyat}" if fiyat else isim,"button": {"text": "İncele →","onClick": {"openLink": {"url": l}}}}})
+        d_f = du.get("fiyat",""); z_f = zu.get("fiyat","")
+        if d_f and z_f: widgets.append({"decoratedText": {"startIcon": {"knownIcon": "DOLLAR"},"text": f"<b>Defacto:</b> {d_f}  vs  <b>Diğer:</b> {z_f}"}})
+        sections.append({"header": f"{kat_emoji} {etiket}  ({int(skor*100)}%)","collapsible": True, "uncollapsibleWidgetsCount": 4, "widgets": widgets})
+    card = {"cardsV2": [{"cardId": f"benzer_{baslik}", "card": {"header": {"title": f"🔁 {baslik}", "subtitle": f"{zaman}  ·  {len(eslesler)} benzer" + (f"  ·  🚨 {acil} ACİL" if acil else "")}, "sections": sections}}]}
+    sc = post(webhook(cinsiyet), card)
+    log(f"  🔁 {baslik} [{cinsiyet}]: {len(eslesler)} eşleşme (HTTP {sc})")
+
+def send_hata(marka, sebep):
+    url = webhook(marka.get("cinsiyet","kadin"))
+    post(url, {"text": f"⚠️ *{marka['ad']}* — {datetime.now().strftime('%d/%m %H:%M')}\n{sebep}"})
+    log(f"  ⚠️ {marka['ad']}: {sebep}")
+
+
+# ── n8n ──
+N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
+def send_to_n8n(eslesler_list):
+    if not N8N_WEBHOOK_URL: return
+    payload = {"zaman": datetime.now().isoformat(), "toplam_eslesme": len(eslesler_list),
+               "acil_eslesme": sum(1 for e in eslesler_list if e["skor"]>=0.85), "eslesmeler": []}
+    for e in eslesler_list:
+        du, zu, skor = e["defacto"], e["zara"], e["skor"]
+        et = "Aynı Ürün" if skor>=0.95 else "ACİL" if skor>=0.85 else "Çok Benzer" if skor>=0.75 else "Benzer"
+        payload["eslesmeler"].append({"etiket": et, "eslesme_skoru": round(skor,3),
+            "defacto": {k: du.get(k,"") for k in ("isim","fiyat","link","gorsel")},
+            "zara":    {k: zu.get(k,"") for k in ("isim","fiyat","link","gorsel")}})
+    try: requests.post(N8N_WEBHOOK_URL, json=payload, timeout=15)
+    except: pass
+
+
+# ══════════════════════════════════════════════════════════════
+# BÖLÜM 4 — PLAYWRIGHT SCRAPER (v14 BİREBİR — ÇALIŞAN)
+# ══════════════════════════════════════════════════════════════
+
+async def kapat_popup(page):
+    for sel in [
+        "#onetrust-accept-btn-handler",".onetrust-accept-btn-handler",
+        "button:has-text('Accept All')","button:has-text('Accept')",
+        "button:has-text('Aceptar todo')","button:has-text('Aceptar')",
+        "button:has-text('KABUL ET')","button:has-text('Kabul Et')",
+        "button:has-text('Tümünü kabul et')",
+        "button:has-text('Close')","button:has-text('Shop Now')",
+        "button:has-text('Continue')","button:has-text('SÍ, CONTINUAR')",
+        "button:has-text('Sí')","button:has-text('SÍ')",
+        "button:has-text('EVET')","button:has-text('Evet')",
+        "button:has-text('はい')","button:has-text('예')",
+        "button:has-text('نعم')","button:has-text('موافق')",
+        "button:has-text('Guardar')","button:has-text('Confirmar')",
+        "button:has-text('AGREE')","button:has-text('I AGREE')",
+        ".cookie-consent button","#popin_tc_privacy_button",
+        "[aria-label='Close']","[aria-label='close']",
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(): await btn.click(); await page.wait_for_timeout(400)
+        except: pass
+
+async def scroll_down(page, step=1200, wait=180, max_same=3):
+    prev, same, pos = 0, 0, 0
+    while True:
+        await page.evaluate(f"window.scrollTo(0,{pos})"); await page.wait_for_timeout(wait); pos += step
+        h = await page.evaluate("document.body.scrollHeight")
+        if h == prev:
+            same += 1
+            if same >= max_same: break
+        else: same, prev = 0, h
+    return prev
+
+
+# ── JS Scraperlar (v14 birebir — uzun versiyon) ──
+
+ZARA_JS = r"""(url) => {
+    const slugToName = h => { try { const slug=decodeURIComponent(h.split('/').filter(Boolean).pop()||''); return slug.replace(/\.html.*/,'').replace(/-l\d+$/,'').replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase()); } catch(e){return '';} };
+    const R=[],S=new Set(),base=new URL(url).origin;
+
+    // Attempt 1: Extract from Next.js __NEXT_DATA__ (Zara SSR)
+    try {
+        const nd=document.getElementById('__NEXT_DATA__');
+        if(nd){
+            const walk=(obj,d)=>{
+                if(!obj||typeof obj!=='object'||d>12)return;
+                if(Array.isArray(obj)){obj.forEach(i=>walk(i,d+1));return;}
+                if(obj.id&&obj.name&&typeof obj.name==='string'&&obj.name.length>1&&(obj.seo||obj.xmedia||obj.prices)){
+                    let link='',g='',price='';
+                    if(obj.seo?.url) link=obj.seo.url.startsWith('http')?obj.seo.url:base+obj.seo.url;
+                    else if(obj.seo?.keyword) link=base+'/'+url.split('/').filter(Boolean)[1]+'/'+url.split('/').filter(Boolean)[2]+'/'+obj.seo.keyword+'.html';
+                    if(!link||S.has(link)){Object.values(obj).forEach(v=>walk(v,d+1));return;}
+                    S.add(link);
+                    const media=obj.xmedia||obj.images||[];
+                    if(media.length){const m=media[0];const raw=m.url||m.path||'';g=raw?(raw.startsWith('//')?'https:'+raw:raw)+'?ts=1&w=600&f=auto':'';}
+                    if(obj.prices?.length){const p=obj.prices[0];price=(p.formattedAmount||String(p.amount||'')).replace(/\n.*/,'');}
+                    R.push({isim:obj.name,fiyat:price,link:link,gorsel:g});
+                }
+                Object.values(obj).forEach(v=>walk(v,d+1));
+            };
+            walk(JSON.parse(nd.textContent)?.props?.pageProps,0);
+            if(R.length>0)return R;
+        }
+    } catch(e){}
+
+    // Attempt 2: DOM scraping with broader selectors
+    let items=document.querySelectorAll('[data-productid],li[class*="product-grid-product"],li[class*="product-grid"],article[class*="product"]');
+    if(!items.length) items=document.querySelectorAll('li[class*="product"],li[class*="item"],article[class*="item"]');
+    if(!items.length) items=document.querySelectorAll('li,article');
+    items.forEach(el=>{
+        const a=el.querySelector('a[href*=".html"],a[href*="/p/"]')||el.querySelector('a[href]'); if(!a) return;
+        const h=a.href; if(!h.includes(base)||h===url||S.has(h)) return;
+        if(/\/(l|n)\d{3,}\.html/.test(h)||/[?#]/.test(h.replace(url,''))&&h===url) return;
+        if(/-(l|n)\d{3,}$/.test(h)) return;
+        S.add(h);
+        let g=''; for(const img of el.querySelectorAll('img')){ const raw=img.src||img.dataset?.src||img.getAttribute('data-src')||img.getAttribute('srcset')||''; const src=raw.trim().split(/\s+/)[0]; const fixed=src.startsWith('//')?'https:'+src:src; if(fixed&&(fixed.includes('.jpg')||fixed.includes('.webp'))&&!fixed.includes('logo')){g=fixed.split('?')[0]+'?ts=1&w=600&f=auto';break;} }
+        let n=''; for(const ns of['[class*="name"]','[class*="product-name"]','[aria-label]','h2','h3','h4']){ const e=el.querySelector(ns); const t=e?(e.getAttribute('aria-label')||e.innerText||'').trim():''; if(t.length>1&&t.length<120){n=t;break;} }
+        if(!n) n=a.getAttribute('aria-label')||a.getAttribute('title')||slugToName(h)||'Ürün';
+        const p=el.querySelector('[class*="price__amount"],[class*="money-amount"],[class*="price"],[class*="Price"]');
+        R.push({isim:n,fiyat:p?p.innerText.trim().split(String.fromCharCode(10))[0]:'',link:h,gorsel:g});
+    }); return R;
+}"""
+
+INDITEX_JS = r"""(url) => {
+    const slugToName = h => { try { const slug=decodeURIComponent(h.split('/').filter(Boolean).pop()||''); return slug.replace(/\.html.*/,'').replace(/-(c|n|l)\d+$/,'').replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase()); } catch(e){return '';} };
+    const R=[],S=new Set(),base=new URL(url).origin;
+
+    // Attempt 1: __NEXT_DATA__ / preloaded state
+    try {
+        const nd=document.getElementById('__NEXT_DATA__');
+        if(nd){
+            const walk=(obj,d)=>{
+                if(!obj||typeof obj!=='object'||d>12)return;
+                if(Array.isArray(obj)){obj.forEach(i=>walk(i,d+1));return;}
+                if(obj.id&&obj.name&&typeof obj.name==='string'&&obj.name.length>1&&(obj.seo||obj.colors||obj.price)){
+                    let link='',g='',price='';
+                    if(obj.seo?.url) link=obj.seo.url.startsWith('http')?obj.seo.url:base+obj.seo.url;
+                    if(!link||S.has(link)){Object.values(obj).forEach(v=>walk(v,d+1));return;}
+                    S.add(link);
+                    const media=obj.images||obj.xmedia||[];
+                    if(media.length){const m=Array.isArray(media[0])?media[0][0]:media[0];const raw=m?.url||m?.path||'';g=raw?(raw.startsWith('//')?'https:'+raw:raw)+'?w=600':'';}
+                    if(obj.price?.value) price=String(obj.price.value)+' '+(obj.price.currency||'');
+                    R.push({isim:obj.name,fiyat:price.trim(),link:link,gorsel:g});
+                }
+                Object.values(obj).forEach(v=>walk(v,d+1));
+            };
+            walk(JSON.parse(nd.textContent)?.props?.pageProps,0);
+            if(R.length>0)return R;
+        }
+    } catch(e){}
+
+    // Attempt 2: DOM scraping with broad selectors
+    let items=document.querySelectorAll('[data-productid]');
+    if(!items.length) items=document.querySelectorAll('li.gridItem,li[class*="grid"],li[class*="product"]');
+    if(!items.length) items=document.querySelectorAll('article[class*="product"],section li[class*="item"]');
+    if(!items.length) items=document.querySelectorAll('li');
+    items.forEach(el=>{
+        const a=el.querySelector('a[href*=".html"],a[href*="/p/"]')||el.querySelector('a[href]'); if(!a) return;
+        const h=a.href.split('?')[0]; if(!h.includes(base)||h===url||h.length<45||S.has(h)) return;
+        const slug=h.split('/').filter(Boolean).pop()||'';
+        if(/^(yeni|nuevo|new|novedades|kadin|erkek|mujer|hombre|women|men|chica|chico|woman|man|kiz|ninas|ninos)/.test(slug)) return;
+        if(/-(n|l|c)\d{3,}$/.test(slug)) return; S.add(h);
+        let g=''; for(const img of el.querySelectorAll('img')){ const raw=img.src||img.getAttribute('data-src')||img.getAttribute('data-srcset')||img.getAttribute('srcset')||''; const src=raw.trim().split(/\s+/)[0]; const fixed=src.startsWith('//')?'https:'+src:src; if(fixed&&!fixed.includes('svg')&&!fixed.includes('logo')&&(fixed.includes('.jpg')||fixed.includes('.webp'))){g=fixed.split('?')[0]+'?w=600';break;} }
+        let n=''; for(const ns of['[class*="name"]','[class*="product-name"]','[class*="title"]','[aria-label]','h2','h3','h4']){ const e=el.querySelector(ns); const t=e?(e.getAttribute('aria-label')||e.innerText||'').trim():''; if(t.length>1&&t.length<120){n=t;break;} }
+        if(!n) n=a.getAttribute('aria-label')||a.getAttribute('title')||slugToName(h)||'Ürün';
+        const p=el.querySelector('[class*="price"],[class*="amount"],[class*="Price"]');
+        R.push({isim:n,fiyat:p?p.innerText.trim().split(String.fromCharCode(10))[0]:'',link:h,gorsel:g});
+    }); return R;
+}"""
+
+STRADIVARIUS_JS = r"""(url) => {
+    const base = new URL(url).origin;
+    const slugToName = h => { try { const s=decodeURIComponent(h.split('/').filter(Boolean).pop()||''); return s.replace(/-(n|c|l)\d+$/,'').replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase()); } catch(e){return '';} };
+    const R=[], S=new Set();
+    const els = [...document.querySelectorAll('a[href],a[data-href]')];
+    els.forEach(a => {
+        const raw = a.getAttribute('data-href') || a.getAttribute('href') || '';
+        if(!raw || raw === '#') return;
+        let h = raw.startsWith('http') ? raw : (raw.startsWith('/') ? base + raw : '');
+        h = h.split('?')[0];
+        if(!h || !h.includes('stradivarius') || S.has(h) || h === url) return;
+        if(/\/(n|c|l)\d{3,}$/.test(h.split('/').pop())) return;
+        if(/null$/.test(h)) return;
+        S.add(h);
+        const el = a.closest('li') || a.closest('article') || a.closest('[class*="product"]') || a.closest('[class*="grid-item"]') || a.parentElement;
+        let g = '', n = '', p = '';
+        if(el){
+            for(const img of el.querySelectorAll('img')){
+                const src=(img.src||img.getAttribute('data-src')||img.getAttribute('srcset')||'').trim().split(/\s+/)[0];
+                const fixed=src.startsWith('//')?'https:'+src:src;
+                if(fixed&&!fixed.includes('svg')&&!fixed.includes('logo')&&(fixed.includes('.jpg')||fixed.includes('.webp'))){g=fixed.split('?')[0]+'?w=600';break;}
+            }
+            for(const ns of['[class*="name"]','[class*="product-name"]','[class*="title"]','h2','h3','h4']){
+                const e=el.querySelector(ns); const t=e?e.innerText.trim():'';
+                if(t.length>1&&t.length<120){n=t;break;}
+            }
+            const pe=el.querySelector('[class*="price"],[class*="amount"],[class*="Price"]');
+            if(pe) p=pe.innerText.trim().split(String.fromCharCode(10))[0];
+        }
+        if(!n) n=a.getAttribute('aria-label')||a.getAttribute('title')||a.getAttribute('alt')||slugToName(h)||'Ürün';
+        if(n && n.length > 1) R.push({isim:n, fiyat:p, link:h, gorsel:g});
+    });
+    return R;
+}"""
+
+YSL_JS = r"""(url) => {
+    const R=[],S=new Set();
+    document.querySelectorAll('script[type="application/ld+json"]').forEach(s=>{ try { const d=JSON.parse(s.textContent); const items=(d['@type']==='ItemList'?d.itemListElement:null)||(d.mainEntity?.['@type']==='ItemList'?d.mainEntity.itemListElement:null)||[]; items.forEach(item=>{ const prod=item.item||item; const h=(prod.url||'').replace(/\?.*$/,''); if(!h||S.has(h)) return; S.add(h); R.push({isim:prod.name||'',fiyat:prod.offers?.price?`${prod.offers.price} ${prod.offers.priceCurrency||''}`.trim():'',link:h,gorsel:prod.image?.[0]||prod.image||''}); }); } catch(e){} });
+    if(R.length) return R;
+    const sels=['article[data-testid]','[class*="ProductCard"]','[class*="product-card"]','[class*="product-item"]','li[class*="product"]'];
+    let items=[]; for(const sel of sels){items=[...document.querySelectorAll(sel)];if(items.length)break;}
+    items.forEach(el=>{ const a=el.querySelector('a[href*="/product"],a[href*="/p/"],a[href]'); if(!a) return; const h=(a.href||'').split('?')[0]; if(!h.includes('ysl.com')||S.has(h)||h===url) return; S.add(h); let g=''; for(const img of el.querySelectorAll('img')){const src=(img.src||img.getAttribute('data-src')||'').split('?')[0];if(src&&(src.includes('.jpg')||src.includes('.webp'))&&!src.includes('logo')){g=src+'?w=600';break;}} const n=el.querySelector('[class*="name"],[class*="title"],[class*="Name"],[class*="Title"]')?.innerText?.trim()||a.getAttribute('aria-label')||''; const p=el.querySelector('[class*="price"],[class*="Price"]')?.innerText?.trim()?.split('\n')[0]||''; if(n&&n.length>1) R.push({isim:n,fiyat:p,link:h,gorsel:g}); });
+    return R;
+}"""
+
+UNIQLO_JS = r"""(url) => {
+    const R=[],S=new Set();
+    const productPattern=/\/eu[^/]*\/en\/products\/[^?#]+/;
+    document.querySelectorAll('a[href]').forEach(a=>{ const h=a.href.split('?')[0]; if(!productPattern.test(h)||S.has(h)) return; S.add(h); const el=a.closest('li')||a.closest('article')||a.closest('[class*="product"]')||a.parentElement; let g='',n='',p=''; if(el){ for(const img of el.querySelectorAll('img')){const src=(img.src||img.getAttribute('data-src')||img.getAttribute('srcset')||'').trim().split(/\s+/)[0];const fixed=src.startsWith('//')?'https:'+src:src;if(fixed&&(fixed.includes('.jpg')||fixed.includes('.webp'))&&!fixed.includes('logo')){g=fixed.split('?')[0]+'?width=600';break;}} n=el.querySelector('[class*="name"],[class*="title"],[class*="productName"]')?.innerText?.trim()||a.getAttribute('aria-label')||''; p=el.querySelector('[class*="price"],[class*="Price"]')?.innerText?.trim()?.split('\n')[0]||''; } if(!n||n.length<2){const slug=h.split('/').pop()||'';n=slug.replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase()).substring(0,60)||'Ürün';} R.push({isim:n,fiyat:p,link:h,gorsel:g}); });
+    return R;
+}"""
+
+ARITZIA_JS = r"""() => {
+    const R=[],S=new Set();
+    const fixUrl = s => { if(!s) return ''; const src=s.trim().split(/\s+/)[0]; return src.startsWith('//')?'https:'+src:src.startsWith('http')?src:''; };
+    document.querySelectorAll('a[href*="/product/"]').forEach(a=>{
+        const h=a.href.split('?')[0]; if(!h.includes('aritzia.com')||S.has(h)) return; S.add(h);
+        const c=a.closest('li')||a.closest('article')||a.closest('[class*="product"]')||a.parentElement;
+        let g='',n='',f='';
+        n=a.getAttribute('aria-label')||a.getAttribute('title')||a.getAttribute('data-name')||'';
+        if(!n&&c) n=c.getAttribute('aria-label')||c.getAttribute('data-product-name')||c.getAttribute('data-name')||'';
+        if(!n&&c){ const ne=c.querySelector('[class*="name"],[class*="title"],[class*="product-name"]'); if(ne) n=ne.innerText.trim(); }
+        if(!n) n=a.innerText.trim().substring(0,60);
+        if(c){ for(const img of c.querySelectorAll('img')){ const raw=img.getAttribute('srcset')||img.getAttribute('data-srcset')||img.getAttribute('data-src')||img.src||''; const fixed=fixUrl(raw); if(fixed&&!fixed.includes('svg')&&!fixed.includes('logo')){g=fixed.split('?')[0]+'?w=600';break;} } const p=c.querySelector('[class*="price"],[class*="Price"]'); if(p) f=p.innerText.trim().split(String.fromCharCode(10))[0]; }
+        if(!n||n.length<2){ const slug=h.split('/product/')[1]||''; n=slug.split('?')[0].replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase()).substring(0,60); }
+        R.push({isim:n,fiyat:f,link:h,gorsel:g});
+    }); return R;
+}"""
+
+SHOPIFY_JS = r"""(url) => {
+    const R=[],S=new Set(),base=new URL(url).origin;
+    document.querySelectorAll('a[href*="/products/"]').forEach(a=>{
+        const h=(a.href||'').split('?')[0]; if(!h.includes(base)||S.has(h)) return; S.add(h);
+        const el=a.closest('li')||a.closest('article')||a.closest('[class*="product"]')||a.closest('[class*="grid"]')||a.parentElement;
+        let g='',n='',p='';
+        n=a.getAttribute('aria-label')||a.getAttribute('title')||'';
+        if(!n&&el){ const ne=el.querySelector('[class*="title"],[class*="name"],[class*="product-title"],[class*="card-title"]'); if(ne) n=ne.innerText.trim(); }
+        if(!n) n=a.innerText.trim().substring(0,60);
+        if(!n||n.length<2){ const slug=h.split('/products/')[1]||''; n=slug.replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase()).substring(0,60); }
+        if(el){ for(const img of el.querySelectorAll('img')){ const raw=img.getAttribute('srcset')||img.getAttribute('data-srcset')||img.getAttribute('data-src')||img.src||''; const src=raw.trim().split(/\s+/)[0]; const fixed=src.startsWith('//')?'https:'+src:src; if(fixed&&fixed.startsWith('http')&&!fixed.includes('logo')&&!fixed.includes('svg')&&(fixed.includes('.jpg')||fixed.includes('.webp'))){g=fixed.split('?')[0]+'?width=600';break;} } const pe=el.querySelector('[class*="price"],[class*="Price"]'); if(pe) p=pe.innerText.trim().split('\n')[0]; }
+        R.push({isim:n,fiyat:p,link:h,gorsel:g});
+    }); return R;
+}"""
+
+DEFACTO_JS = r"""() => {
+    const R=[],S=new Set();
+    document.querySelectorAll('.product-card,[class*="product-item"],[class*="productCard"]').forEach(el=>{
+        const a=el.querySelector('a[href]'); if(!a) return;
+        const h=a.href.split('?')[0]; if(S.has(h)||!h.includes('defacto')) return; S.add(h);
+        let n=el.querySelector('[class*="title"],[class*="name"],[class*="product-name"]')?.innerText?.trim()||'Ürün';
+        let p=el.querySelector('[class*="price"],[class*="Price"]')?.innerText?.trim()?.split('\n')[0]||'';
+        let g=''; for(const img of el.querySelectorAll('img')){ const raw=img.getAttribute('data-src')||img.getAttribute('srcset')||img.src||''; const src=raw.trim().split(/\s+/)[0]; const fixed=src.startsWith('//')?'https:'+src:src; if(fixed&&fixed.startsWith('http')&&!fixed.includes('logo')&&!fixed.includes('svg')){g=fixed.split('?')[0]+'?width=600';break;} }
+        if(!n||n.length<2){const slug=(h.split('/').pop()||'').replace(/-/g,' ');n=slug.replace(/\b\w/g,c=>c.toUpperCase()).substring(0,60)||'Ürün';}
+        R.push({isim:n,fiyat:p,link:h,gorsel:g});
+    }); return R;
+}"""
+
+
+# ── Zara JSON API (scraping'e gerek yok) ──
+
+def _zara_kategori_id(url: str) -> str:
+    """URL'den Zara kategori ID'sini çıkar: ?v1=2546081 → 2546081"""
+    m = re.search(r'[?&]v1=(\d+)', url)
+    return m.group(1) if m else ""
+
+def _zara_base_path(url: str) -> str:
+    """https://www.zara.com/tr/tr/... → /tr/tr"""
+    parts = url.replace("https://www.zara.com","").split("/")
+    return "/" + "/".join(p for p in parts[:3] if p)
+
+def zara_api_cek(marka_url: str, accept_lang: str) -> list:
+    """Zara REST API ile ürünleri çek — browser gerektirmez."""
+    cat_id = _zara_kategori_id(marka_url)
+    if not cat_id:
+        return []
+    base_path = _zara_base_path(marka_url)
+    origin = "https://www.zara.com"
+    api_url = f"{origin}{base_path}/category/{cat_id}/products?ajax=true"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": accept_lang,
+        "Referer": marka_url,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "sec-ch-ua": '"Chromium";v="124","Google Chrome";v="124","Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    }
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+    except Exception:
+        return []
+
+    urunler = []
+    elements = data if isinstance(data, list) else data.get("elements", data.get("productGroups", []))
+    # productGroups bazlı yanıt
+    if isinstance(elements, list) and elements and isinstance(elements[0], dict):
+        if "elements" in elements[0]:
+            flat = []
+            for grp in elements:
+                flat.extend(grp.get("elements", []))
+            elements = flat
+
+    seen = set()
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        for prod in el.get("commercialComponents", [el]):
+            if not isinstance(prod, dict):
+                continue
+            name = prod.get("name") or ""
+            if not name or len(name) < 2:
+                continue
+            seo = prod.get("seo", {}) or {}
+            seo_url = seo.get("url", "")
+            if seo_url:
+                link = seo_url if seo_url.startswith("http") else origin + seo_url
+            else:
+                keyword = seo.get("keyword", "")
+                if keyword:
+                    link = f"{origin}{base_path}/{keyword}.html"
+                else:
+                    pid = prod.get("id", "")
+                    link = f"{origin}{base_path}/p{pid}.html" if pid else ""
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            gorsel = ""
+            for media in (prod.get("xmedia") or prod.get("images") or []):
+                if isinstance(media, dict):
+                    raw = media.get("url", "")
+                    if raw:
+                        if raw.startswith("//"):
+                            gorsel = "https:" + raw.split("?")[0] + "?ts=1&w=600&f=auto"
+                        elif raw.startswith("http"):
+                            gorsel = raw.split("?")[0] + "?ts=1&w=600&f=auto"
+                        else:
+                            gorsel = ("https://static.zara.net" + ("" if raw.startswith("/") else "/assets/public/") + raw).split("?")[0] + "?ts=1&w=600&f=auto"
+                    else:
+                        path = media.get("path", "")
+                        name = media.get("name", "") or (path.split("/")[-1] + ".jpg" if path else "")
+                        ts   = media.get("timestamp", "1")
+                        if path:
+                            base = "https://static.zara.net/assets/public/" + path.lstrip("/")
+                            gorsel = f"{base}/{name}?ts={ts}&w=600&f=auto" if name and not path.endswith(name) else f"{base}?ts={ts}&w=600&f=auto"
+                    if gorsel:
+                        break
+            price_obj = prod.get("price") or {}
+            if isinstance(price_obj, dict):
+                amt = price_obj.get("value") or price_obj.get("formattedAmount") or ""
+                cur = price_obj.get("currency", "")
+                fiyat = f"{amt} {cur}".strip()
+            else:
+                prices = prod.get("prices", [])
+                fiyat = prices[0].get("formattedAmount", "") if prices else ""
+            urunler.append({"isim": name, "fiyat": fiyat, "link": link, "gorsel": gorsel})
+    return urunler
+
+
+# ── Inditex JSON API (Massimo Dutti, Bershka) ──
+def _inditex_kategori_id(url: str) -> str:
+    """URL'den Inditex kategori n-ID'sini çıkar: yenilik-n1474 → 1474"""
+    m = re.search(r'-n(\d+)', url.split('?')[0])
+    return m.group(1) if m else ""
+
+def inditex_api_cek(marka_url: str, accept_lang: str) -> list:
+    """Massimo Dutti / Bershka JSON API ile ürünleri çek."""
+    from urllib.parse import urlparse
+    cat_id = _inditex_kategori_id(marka_url)
+    if not cat_id:
+        return []
+    parsed = urlparse(marka_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    parts = parsed.path.strip("/").split("/")  # ['tr', 'kadin', 'yenilik-n1474']
+    country = parts[0] if len(parts) > 0 else "es"
+    api_url = f"{origin}/{country}/category/{cat_id}/products?ajax=true"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": accept_lang,
+        "Referer": marka_url,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    }
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+    except Exception:
+        return []
+
+    urunler = []
+    elements = data if isinstance(data, list) else data.get("elements", data.get("productGroups", []))
+    if isinstance(elements, list) and elements and isinstance(elements[0], dict) and "elements" in elements[0]:
+        flat = []
+        for grp in elements:
+            flat.extend(grp.get("elements", []))
+        elements = flat
+
+    seen = set()
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        for prod in el.get("commercialComponents", [el]):
+            if not isinstance(prod, dict):
+                continue
+            name = prod.get("name") or ""
+            if not name or len(name) < 2:
+                continue
+            seo = prod.get("seo", {}) or {}
+            seo_url = seo.get("url", "")
+            link = (seo_url if seo_url.startswith("http") else origin + seo_url) if seo_url else ""
+            if not link:
+                keyword = seo.get("keyword", "")
+                if keyword and len(parts) >= 2:
+                    link = f"{origin}/{parts[0]}/{keyword}"
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            gorsel = ""
+            for media in (prod.get("xmedia") or prod.get("images") or []):
+                if isinstance(media, dict):
+                    raw = media.get("url", "") or media.get("path", "")
+                    if raw:
+                        if raw.startswith("http"):
+                            gorsel = raw
+                        elif raw.startswith("//"):
+                            gorsel = "https:" + raw
+                        elif raw.startswith("/"):
+                            cdn = origin.replace("://www.", "://static.").replace(".com", ".net")
+                            gorsel = cdn + raw
+                        else:
+                            cdn = origin.replace("://www.", "://static.").replace(".com", ".net")
+                            gorsel = cdn + "/" + raw
+                        gorsel = gorsel.split("?")[0] + "?w=600"
+                        break
+            price_obj = prod.get("price") or {}
+            amt = (price_obj.get("value") or price_obj.get("formattedAmount") or "") if isinstance(price_obj, dict) else ""
+            cur = price_obj.get("currency", "") if isinstance(price_obj, dict) else ""
+            urunler.append({"isim": name, "fiyat": f"{amt} {cur}".strip(), "link": link, "gorsel": gorsel})
+    return urunler
+# ── Locale → Accept-Language haritası ──
+_LANG_MAP = {
+    "tr-TR": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "es-ES": "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7",
+    "ja-JP": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    "ko-KR": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "en-US": "en-US,en;q=0.9",
+    "en-CA": "en-CA,en;q=0.9",
+    "pl-PL": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+    "ro-RO": "ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+_STEALTH_JS = """
+Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
+Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
+window.chrome={
+    runtime:{connect:()=>({}),sendMessage:()=>{},onMessage:{addListener:()=>{}}},
+    loadTimes:()=>({}),csi:()=>({}),app:{isInstalled:false,getDetails:()=>({})}
+};
+const _origPerm=window.navigator.permissions.query.bind(navigator.permissions);
+window.navigator.permissions.query=(p)=>
+    p.name==='notifications'?Promise.resolve({state:Notification.permission}):_origPerm(p);
+"""
+
+# ── v14 BİREBİR tara() — GELİŞMİŞ STEALTH + BEKLEME ──
+async def tara(browser, marka):
+    accept_lang = _LANG_MAP.get(marka["locale"], "en-US,en;q=0.9")
+    ctx = await browser.new_context(
+        viewport={"width": 1440, "height": 900},
+        locale=marka["locale"], timezone_id=marka["tz"],
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        extra_http_headers={
+            "Accept-Language": accept_lang,
+            "sec-ch-ua": '"Chromium";v="124","Google Chrome";v="124","Not-A.Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "Upgrade-Insecure-Requests": "1",
+        },
+    )
+    await ctx.add_init_script(_STEALTH_JS)
+    page = await ctx.new_page()
+    urunler = []
+    try:
+        tip = marka["tip"]
+
+        if tip == "ysl":
+            await page.goto(marka["url"], wait_until="networkidle", timeout=60000)
+            await page.wait_for_timeout(3000)
+            await kapat_popup(page); await page.wait_for_timeout(1000); await kapat_popup(page)
+            await scroll_down(page, step=800, wait=300, max_same=4)
+            await page.wait_for_timeout(1000)
+            urunler = await page.evaluate(YSL_JS, marka["url"])
+
+        elif tip == "uniqlo":
+            await page.goto(marka["url"], wait_until="domcontentloaded", timeout=50000)
+            await page.wait_for_timeout(2500)
+            await kapat_popup(page)
+            await scroll_down(page, step=800, wait=300, max_same=4)
+            await page.wait_for_timeout(1000)
+            urunler = await page.evaluate(UNIQLO_JS, marka["url"])
+
+        elif tip == "aritzia":
+            await page.goto(marka["url"], wait_until="domcontentloaded", timeout=50000)
+            await page.wait_for_timeout(2000)
+            await kapat_popup(page)
+            await scroll_down(page, step=1000, wait=250, max_same=4)
+            await page.wait_for_timeout(1000)
+            await kapat_popup(page)
+            await scroll_down(page, step=1000, wait=250, max_same=3)
+            urunler = await page.evaluate(ARITZIA_JS)
+
+        elif tip == "shopify":
+            await page.goto(marka["url"], wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(1500)
+            await kapat_popup(page)
+            await scroll_down(page, step=1000, wait=200, max_same=3)
+            urunler = await page.evaluate(SHOPIFY_JS, marka["url"])
+
+        elif tip == "zara":
+            # 1. API önce dene (hızlı, bot tespiti yok)
+            loop = asyncio.get_event_loop()
+            urunler = await loop.run_in_executor(
+                None, zara_api_cek, marka["url"], accept_lang)
+            if urunler:
+                log(f"   ✓ {marka['ad']}: {len(urunler)} ürün (API)")
+                await ctx.close()
+                return urunler
+            # 2. API başarısız → browser ile aç
+            log(f"   ⚠️ {marka['ad']}: API boş, browser ile deneniyor...")
+            await page.goto(marka["url"], wait_until="networkidle", timeout=55000)
+            await page.wait_for_timeout(3000)
+            await kapat_popup(page); await page.wait_for_timeout(800); await kapat_popup(page)
+            try:
+                await page.wait_for_selector(
+                    '[data-productid],li[class*="product"],article[class*="product"],#__NEXT_DATA__',
+                    timeout=10000)
+            except: pass
+            await scroll_down(page, step=800, wait=400, max_same=5)
+            await page.wait_for_timeout(1500)
+            urunler = await page.evaluate(ZARA_JS, marka["url"])
+            if not urunler:
+                title = await page.title()
+                log(f"   ⚠️ {marka['ad']}: 0 ürün (retry) — sayfa: {title[:60]}")
+                await page.wait_for_timeout(4000)
+                await scroll_down(page, step=800, wait=400, max_same=3)
+                urunler = await page.evaluate(ZARA_JS, marka["url"])
+
+        elif tip == "stradivarius":
+            # 1. API önce dene (Inditex API pattern)
+            loop = asyncio.get_event_loop()
+            urunler = await loop.run_in_executor(
+                None, inditex_api_cek, marka["url"], accept_lang)
+            if urunler:
+                log(f"   ✓ {marka['ad']}: {len(urunler)} ürün (API)")
+                await ctx.close()
+                return urunler
+            # 2. API başarısız → browser ile aç
+            log(f"   ⚠️ {marka['ad']}: API boş, browser ile deneniyor...")
+            await page.goto(marka["url"], wait_until="networkidle", timeout=60000)
+            await page.wait_for_timeout(3000)
+            await kapat_popup(page); await page.wait_for_timeout(600); await kapat_popup(page)
+            try:
+                await page.wait_for_selector(
+                    'a[href*=".html"],a[data-href*=".html"]', timeout=10000)
+            except: pass
+            await scroll_down(page, step=900, wait=300, max_same=5)
+            await page.wait_for_timeout(1200)
+            urunler = await page.evaluate(STRADIVARIUS_JS, marka["url"])
+            urunler = [u for u in urunler if u.get("link","") and "null" not in u["link"]]
+            if not urunler:
+                title = await page.title()
+                log(f"   ⚠️ {marka['ad']}: 0 ürün (retry) — sayfa: {title[:60]}")
+                await page.wait_for_timeout(4000)
+                await scroll_down(page, step=900, wait=300, max_same=3)
+                urunler = await page.evaluate(STRADIVARIUS_JS, marka["url"])
+                urunler = [u for u in urunler if u.get("link","") and "null" not in u["link"]]
+
+        elif tip == "inditex":
+            # 1. API önce dene
+            loop = asyncio.get_event_loop()
+            urunler = await loop.run_in_executor(
+                None, inditex_api_cek, marka["url"], accept_lang)
+            if urunler:
+                log(f"   ✓ {marka['ad']}: {len(urunler)} ürün (API)")
+                await ctx.close()
+                return urunler
+            # 2. API başarısız → browser ile aç
+            log(f"   ⚠️ {marka['ad']}: API boş, browser ile deneniyor...")
+            await page.goto(marka["url"], wait_until="networkidle", timeout=55000)
+            await page.wait_for_timeout(2500)
+            await kapat_popup(page); await page.wait_for_timeout(800); await kapat_popup(page)
+            try:
+                await page.wait_for_selector(
+                    '[data-productid],li[class*="product"],li[class*="grid"],#__NEXT_DATA__',
+                    timeout=10000)
+            except: pass
+            await scroll_down(page, step=800, wait=400, max_same=5)
+            await page.wait_for_timeout(1200)
+            await kapat_popup(page); await scroll_down(page, step=800, wait=300, max_same=3)
+            urunler = await page.evaluate(INDITEX_JS, marka["url"])
+            if not urunler:
+                title = await page.title()
+                log(f"   ⚠️ {marka['ad']}: 0 ürün (retry) — sayfa: {title[:60]}")
+                await page.wait_for_timeout(4000)
+                await scroll_down(page, step=800, wait=300, max_same=3)
+                urunler = await page.evaluate(INDITEX_JS, marka["url"])
+
+        elif tip == "defacto":
+            await page.goto(marka["url"], wait_until="domcontentloaded", timeout=40000)
+            await page.wait_for_timeout(1500)
+            await kapat_popup(page)
+            await scroll_down(page)
+            urunler = await page.evaluate(DEFACTO_JS)
+
+        log(f"   ✓ {marka['ad']}: {len(urunler)} ürün")
+    except Exception as e:
+        log(f"   ✗ {marka['ad']}: {str(e)[:80]}")
+    finally:
+        await ctx.close()
+    return urunler
+
+
+# ── og:image Zenginleştirme (v14) ──
+OG_IMAGE_JS = """() => { const m=document.querySelector('meta[property="og:image"]'); return m?m.getAttribute('content'):''; }"""
+
+async def gorsel_zenginlestir(browser, urunler, max_enrich=10):
+    eksik = [u for u in urunler if not u.get("gorsel")][:max_enrich]
+    if not eksik: return urunler
+    async def og_cek(u):
+        ctx = await browser.new_context(viewport={"width":1280,"height":800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        page = await ctx.new_page()
+        try:
+            await page.goto(u["link"], wait_until="domcontentloaded", timeout=20000)
+            og = await page.evaluate(OG_IMAGE_JS)
+            if og and og.startswith("http"): u["gorsel"] = og
+        except: pass
+        finally: await ctx.close()
+    await asyncio.gather(*[og_cek(u) for u in eksik])
+    return urunler
+
+
+# ══════════════════════════════════════════════════════════════
+# BÖLÜM 5 — GEMİNİ AI MODÜLÜ
+# ══════════════════════════════════════════════════════════════
+
+def gemini_sor(prompt: str) -> str:
+    """Google Gemini AI'a soru sor."""
+    if not GEMINI_API_KEY:
+        return "❌ Gemini API key ayarlanmamış."
+    try:
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048}
+        }
+        r = requests.post(GEMINI_URL, json=payload, headers={"Content-Type":"application/json"}, timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            return f"❌ Gemini API hatası: HTTP {r.status_code}\n{r.text[:200]}"
+    except Exception as e:
+        return f"❌ Gemini bağlantı hatası: {e}"
+
+
+def ai_analiz_yap(sayac, benzerlik_sonuclari, marka_durumlari):
+    """Tur sonuçlarını Gemini AI ile analiz et."""
+    basarili = sum(1 for v in marka_durumlari.values() if v.get("urun_sayisi",0) > 0)
+    hatali = sum(1 for v in marka_durumlari.values() if v.get("hata",""))
+
+    # En çok yeni ürün olan markalar
+    en_cok_yeni = sorted(
+        [(ad, v.get("yeni",0)) for ad, v in marka_durumlari.items() if v.get("yeni",0) > 0],
+        key=lambda x: -x[1]
+    )[:10]
+
+    benzerlik_ozet = ""
+    if benzerlik_sonuclari:
+        acil = sum(1 for s in benzerlik_sonuclari if s["skor"] >= 0.85)
+        benzerlik_ozet = f"\n- Toplam {len(benzerlik_sonuclari)} benzerlik eşleşmesi, {acil} tanesi ACİL (>%85)"
+        for s in sorted(benzerlik_sonuclari, key=lambda x: -x["skor"])[:5]:
+            benzerlik_ozet += f"\n  • Defacto '{s['defacto'][:40]}' ↔ '{s['hedef'][:40]}' (%{int(s['skor']*100)})"
+
+    yeni_str = "\n".join(f"  • {ad}: {say} yeni" for ad, say in en_cok_yeni) if en_cok_yeni else "  Yeni ürün yok"
+
+    prompt = f"""Sen bir moda perakende analisti AI'sın. DeFacto için rakip analizi yapıyorsun.
+
+Tarama Sonuçları:
+- Başarılı taranan marka sayısı: {basarili}
+- Hatalı: {hatali}
+- Kadın yeni: {sayac.get('kadin',0)}, Erkek yeni: {sayac.get('erkek',0)}, Çocuk yeni: {sayac.get('cocuk',0)}
+- Defacto yeni: {sayac.get('defacto',0)}
+
+En çok yeni ürün ekleyen markalar:
+{yeni_str}
+
+Benzerlik Analizi:{benzerlik_ozet if benzerlik_ozet else ' Benzerlik bulunamadı'}
+
+Lütfen şunları yap:
+1. 🔍 Kısa özet (3 satır)
+2. 🚨 Acil aksiyon önerileri (benzerlik sonuçlarına göre)
+3. 📈 Trend tahmini (hangi kategorilerde hareket var)
+4. 💡 DeFacto için stratejik öneriler
+
+Türkçe ve kısa yaz."""
+
+    return gemini_sor(prompt)
+
+
+def ai_soru_sor_thread(soru, callback):
+    """AI'a ayrı thread'de soru sor."""
+    def worker():
+        cevap = gemini_sor(soru)
+        try: root.after(0, lambda: callback(cevap))
+        except: pass
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════════════
+# BÖLÜM 6 — ANA TUR MOTORU (v14 + GUI log)
+# ══════════════════════════════════════════════════════════════
+
+def log(msg):
+    ts = datetime.now(ISTANBUL_TZ).strftime("%H:%M:%S")
+    satir = f"[{ts}] {msg}"
+    print(satir)   # Terminale de yaz (v14 uyumu)
+    bot_durumu["log_satirlari"].append(satir)
+    if len(bot_durumu["log_satirlari"]) > 500:
+        bot_durumu["log_satirlari"] = bot_durumu["log_satirlari"][-300:]
+    try: root.after(0, _log_ui_guncelle)
+    except: pass
+
+def _log_ui_guncelle():
+    try:
+        log_textbox.configure(state="normal")
+        log_textbox.delete("0.0", "end")
+        log_textbox.insert("0.0", "\n".join(bot_durumu["log_satirlari"][-100:]))
+        log_textbox.see("end")
+        log_textbox.configure(state="disabled")
+    except: pass
+
+
+async def tek_tur_async(tur_no):
+    start = datetime.now()
+    log(f"{'='*55}")
+    log(f"🔄 Tur #{tur_no} — {datetime.now(ISTANBUL_TZ).strftime('%d %B %Y %H:%M:%S')}")
+    log(f"{'='*55}")
+
+    bot_durumu["calisiyor"] = True
+    bot_durumu["son_tur"] = tur_no
+    bot_durumu["toplam_yeni"] = {"kadin":0,"erkek":0,"cocuk":0,"defacto":0}
+    bot_durumu["marka_durumlari"] = {}
+    bot_durumu["benzerlik_sonuclari"] = []
+    bot_durumu["urun_listesi"] = {}
+
+    cache = load_cache()
+    ilk_tur = not bool(cache)
+    if ilk_tur:
+        log("📂 Cache yok — ilk çalıştırma, tüm ürünler kaydedilecek.")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--window-position=10000,0",   # Pencereyi ekran dışına al
+                "--window-size=1440,900",
+                "--disable-infobars",
+                "--disable-extensions",
+                "--disable-default-apps",
+                "--no-first-run",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--flag-switches-begin",
+                "--flag-switches-end",
+            ]
+        )
+
+        async def isle(m):
+            onceki = cache_linkler(cache.get(m["ad"], []))
+            return m, await tara(browser, m), onceki
+
+        sonuclar = []
+        for i in range(0, len(MARKALAR), 6):
+            grup = MARKALAR[i:i+6]
+            log(f"⚡ Grup {1+i//6}: {', '.join(m['ad'] for m in grup)}")
+            sonuclar += list(await asyncio.gather(*[isle(m) for m in grup]))
+        await browser.close()
+
+    log("📨 Yeni ürünler kontrol ediliyor...")
+
+    # og:image zenginleştirme (v14)
+    tum_yeni = []
+    for marka, urunler, onceki in sonuclar:
+        if urunler and not ilk_tur:
+            tum_yeni.extend([u for u in urunler if u["link"] not in onceki])
+    if tum_yeni:
+        log(f"🔍 {len(tum_yeni)} yeni ürün için og:image kontrol...")
+        async with async_playwright() as p2:
+            b2 = await p2.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+            await gorsel_zenginlestir(b2, tum_yeni, max_enrich=10)
+            await b2.close()
+
+    yeni_cache = {}; marka_gruplari = {}; defacto_yeni_by_ad = {}
+    hedef_urun_by_ad = {}; sayac = {"kadin":0,"erkek":0,"cocuk":0,"defacto":0}
+    excel_kayitlar = []
+
+    for marka, urunler, onceki in sonuclar:
+        key = marka["ad"]; tip = marka["tip"]; cinsiyet = marka.get("cinsiyet","kadin")
+        if tip != "defacto": hedef_urun_by_ad[key] = urunler or []
+
+        if urunler:
+            yeni = [u for u in urunler if u["link"] not in onceki]
+            bot_durumu["marka_durumlari"][key] = {"urun_sayisi": len(urunler), "yeni": len(yeni) if not ilk_tur else 0, "hata": ""}
+            bot_durumu["urun_listesi"][key] = urunler  # dashboard detay için sakla
+
+            if tip == "defacto":
+                tum_linkler = {u["link"] for u in urunler} | onceki
+                onceki_urunler = cache_urunler(cache.get(key, {}))
+                onceki_links = {u["link"] for u in onceki_urunler}
+                tum_urunler = onceki_urunler + [u for u in urunler if u["link"] not in onceki_links]
+                yeni_cache[key] = {"linkler": list(tum_linkler), "urunler": tum_urunler[-2000:]}
+                if not ilk_tur and yeni:
+                    defacto_yeni_by_ad[key] = yeni
+                    sayac["defacto"] += len(yeni)
+                    send_defacto_karti(key, yeni, len(urunler), marka["tum_link"], cinsiyet)
+                    for u in yeni: excel_kayitlar.append({"marka_ad": key, "cinsiyet": cinsiyet, "urun": u})
+                elif ilk_tur:
+                    log(f"  📋 {key}: {len(urunler)} ürün kaydedildi (ilk tur)")
+                else:
+                    log(f"  — {key}: {len(urunler)} ürün (0 yeni)")
+            else:
+                yeni_cache[key] = list({u["link"] for u in urunler} | onceki)
+                if yeni and not ilk_tur:
+                    isim = marka_adi(key)
+                    marka_gruplari.setdefault(cinsiyet, {}).setdefault(isim, {})[key] = {
+                        "yeni": yeni, "toplam": len(urunler), "tum_link": marka["tum_link"]}
+                    sayac[cinsiyet] = sayac.get(cinsiyet,0) + len(yeni)
+                    for u in yeni: excel_kayitlar.append({"marka_ad": key, "cinsiyet": cinsiyet, "urun": u})
+                elif ilk_tur:
+                    log(f"  📋 {key}: {len(urunler)} ürün kaydedildi (ilk tur)")
+                else:
+                    log(f"  — {key}: yeni yok")
+        else:
+            default = [] if tip != "defacto" else {"linkler":[],"urunler":[]}
+            yeni_cache[key] = cache.get(key, default)
+            bot_durumu["marka_durumlari"][key] = {"urun_sayisi": 0, "yeni": 0, "hata": "Ürün bulunamadı"}
+            if not ilk_tur and len(onceki) > 5 and tip != "defacto":
+                send_hata(marka, "Ürün bulunamadı (önceki turda vardı)")
+
+    # Webhook kartları gönder
+    for cinsiyet, markalar in marka_gruplari.items():
+        for isim, gruplar in markalar.items():
+            send_grup_karti(isim, gruplar, cinsiyet)
+
+    # Excel yaz
+    if not ilk_tur and excel_kayitlar:
+        excel_tur_yaz(tur_no, excel_kayitlar)
+
+    # Benzerlik analizi (v14 birebir)
+    if not ilk_tur:
+        KATEGORI = {
+            "kadin": {"defacto": ["🍎 Defacto En Yeni","🍎 Defacto Fit Kadın"],
+                      "hedef_anahtar": ["Kadın","MD Kadın","Stradivarius","Bershka Kadın","YSL Kadın","Uniqlo Kadın","Aritzia Kadın","Brandy Melville"]},
+            "erkek": {"defacto": ["🍎 Defacto Love New Erkek","🍎 Defacto Fit Erkek"],
+                      "hedef_anahtar": ["Erkek 🇹🇷","Erkek 🇪🇸","Erkek 🇯🇵","Erkek 🇰🇷","Erkek 🇪🇬","MD Erkek","Bershka Erkek","Uniqlo Erkek"]},
+            "cocuk": {"defacto": ["🍎 Defacto Yeniler Çocuk"],
+                      "hedef_anahtar": ["Kız Çocuk","Erkek Çocuk","Kız Bebek","Erkek Bebek","Bebek","Uniqlo Çocuk"]},
+        }
+        if sayac["defacto"] == 0:
+            log("💤 Defacto'da yeni ürün yok — benzerlik analizi atlandı")
+        else:
+            log(f"🔁 Defacto {sayac['defacto']} yeni ürün ↔ markalar benzerlik analizi...")
+            tum_eslesler = []
+            for cinsiyet, kat in KATEGORI.items():
+                defacto_yeni_kat = []
+                for ad in kat["defacto"]: defacto_yeni_kat.extend(defacto_yeni_by_ad.get(ad, []))
+                if not defacto_yeni_kat: continue
+                hedef_kat = []
+                for ad, ur in hedef_urun_by_ad.items():
+                    if any(a in ad for a in kat["hedef_anahtar"]): hedef_kat.extend(ur)
+                if not hedef_kat: continue
+                eslesler = benzer_urunleri_bul(defacto_yeni_kat, hedef_kat)
+                kat_isim = {"kadin":"Kadın","erkek":"Erkek","cocuk":"Çocuk"}.get(cinsiyet, cinsiyet)
+                if eslesler:
+                    send_benzer_karti(eslesler, f"Defacto {kat_isim} ↔ Markalar", cinsiyet)
+                    for du, zu, skor in eslesler:
+                        bot_durumu["benzerlik_sonuclari"].append({"defacto": du.get("isim",""), "hedef": zu.get("isim",""), "skor": skor, "cinsiyet": cinsiyet})
+                    tum_eslesler.extend([{"defacto":du,"zara":zu,"skor":skor,"kategori":kat_isim} for du,zu,skor in eslesler])
+                else:
+                    log(f"  — Defacto {kat_isim}: benzer ürün yok")
+            if tum_eslesler: send_to_n8n(tum_eslesler)
+
+    save_cache(yeni_cache)
+    bot_durumu["toplam_yeni"] = sayac
+    bot_durumu["son_guncelleme"] = datetime.now(ISTANBUL_TZ).strftime("%d.%m.%Y %H:%M:%S")
+    bot_durumu["calisiyor"] = False
+
+    # Son eklenenler — dashboard thumbnail için
+    if not ilk_tur and excel_kayitlar:
+        yeni_urunler_son = []
+        for kayit in excel_kayitlar:
+            u = dict(kayit["urun"])
+            u["marka_ad"] = kayit["marka_ad"]
+            yeni_urunler_son.append(u)
+        bot_durumu["son_eklenenler"] = (yeni_urunler_son + bot_durumu.get("son_eklenenler", []))[:100]
+        haftalik_kaydet(sum(sayac.values()))
+
+    sure = (datetime.now() - start).seconds
+    log(f"✅ Tur #{tur_no} bitti — {sure//60}dk {sure%60}sn")
+    if ilk_tur:
+        log("📋 İlk tur — bir sonraki turdan itibaren yeni ürünler bildirilecek.")
+    else:
+        t = sum(sayac.values())
+        log(f"📊 {t} yeni | Kadın:{sayac['kadin']} Erkek:{sayac['erkek']} Çocuk:{sayac['cocuk']} Defacto:{sayac['defacto']}")
+
+    # 🤖 Gemini AI analizi
+    if not ilk_tur and sum(sayac.values()) > 0:
+        log("🤖 Gemini AI analizi başlatılıyor...")
+        def ai_callback(cevap):
+            bot_durumu["ai_sonuc"] = cevap
+            log("🤖 AI analizi tamamlandı")
+            try: guncelle_ai_sayfasi()
+            except: pass
+        threading.Thread(target=lambda: ai_callback(
+            ai_analiz_yap(sayac, bot_durumu["benzerlik_sonuclari"], bot_durumu["marka_durumlari"])
+        ), daemon=True).start()
+
+    try: root.after(0, guncelle_dashboard_kartlari)
+    except: pass
+
+
+def tek_tur_thread(tur_no):
+    asyncio.run(tek_tur_async(tur_no))
+
+
+# ══════════════════════════════════════════════════════════════
+# BÖLÜM 7 — ZAMANLAYICI
+# ══════════════════════════════════════════════════════════════
+
+zamanlayici_aktif = False
+tur_sayaci = [0]
+
+def sonraki_calisma():
+    simdi = datetime.now(ISTANBUL_TZ); bugun = simdi.date()
+    for saat in CALISMA_SAATLERI:
+        hedef = datetime.combine(bugun, saat, tzinfo=ISTANBUL_TZ)
+        if hedef > simdi: return (hedef - simdi).total_seconds(), hedef
+    import datetime as dt_mod
+    yarin = bugun + dt_mod.timedelta(days=1)
+    hedef = datetime.combine(yarin, CALISMA_SAATLERI[0], tzinfo=ISTANBUL_TZ)
+    return (hedef - simdi).total_seconds(), hedef
+
+def zamanlayici_dongusu():
+    global zamanlayici_aktif
+    if not zamanlayici_aktif: return
+    if bot_durumu["calisiyor"]:
+        root.after(5000, zamanlayici_dongusu); return
+    bekleme, sonraki = sonraki_calisma()
+    if bekleme <= 5:
+        tur_sayaci[0] += 1
+        log(f"⏰ Zamanlayıcı tetiklendi — Tur #{tur_sayaci[0]}")
+        threading.Thread(target=tek_tur_thread, args=(tur_sayaci[0],), daemon=True).start()
+        root.after(65000, zamanlayici_dongusu)
+    else:
+        sonraki_str = sonraki.strftime("%H:%M"); dk = int(bekleme // 60)
+        try: zamanlayici_lbl.configure(text=f"⏳ Sonraki: {sonraki_str} ({dk} dk)")
+        except: pass
+        root.after(30000, zamanlayici_dongusu)
+
+
+
+# ══════════════════════════════════════════════════════════════
+# BÖLÜM 8 — GUI ARAYÜZ (1 Dosyası Şablonu)
+# ══════════════════════════════════════════════════════════════
+
+root = ctk.CTk()
+root.title("Multi-Brand New In Bot v16 — GUI + Gemini AI")
+root.geometry("1500x900")
+
+# ── SPLASH SCREEN ──
+root.withdraw()
+splash = ctk.CTkToplevel()
+splash.geometry("600x350")
+splash.overrideredirect(True)
+splash.configure(fg_color="#111111")
+splash.attributes("-topmost", True)
+
+ekran_genislik = splash.winfo_screenwidth()
+ekran_yukseklik = splash.winfo_screenheight()
+x = int((ekran_genislik / 2) - (600 / 2))
+y = int((ekran_yukseklik / 2) - (350 / 2))
+splash.geometry(f"600x350+{x}+{y}")
+
+ctk.CTkLabel(splash, text="🛍️ New In Bot", font=("Segoe UI", 56, "bold"), text_color="#f1c40f").pack(expand=True, pady=(60, 0))
+ctk.CTkLabel(splash, text="v16 — GUI + Gemini AI Edition", font=("Segoe UI", 20), text_color="#bdc3c7").pack(pady=(5, 30))
+
+prog_bar = ctk.CTkProgressBar(splash, width=400, fg_color="#2c3e50", progress_color="#f1c40f", mode="indeterminate")
+prog_bar.pack(pady=(0, 40))
+prog_bar.start()
+
+def main_window_goster():
+    prog_bar.stop()
+    splash.destroy()
+    root.deiconify()
+
+splash.after(3000, main_window_goster)
+
+# ── TICKER BAR ──
+ticker_frame = ctk.CTkFrame(root, height=35, corner_radius=0, fg_color="#111111")
+ticker_frame.pack(side="top", fill="x")
+ticker_label = ctk.CTkLabel(ticker_frame, text="🛍️ Bot hazırlanıyor...", font=("Consolas", 12, "bold"), text_color="#2ecc71")
+ticker_label.pack(side="left", padx=10, pady=5)
+
+def scroll_ticker():
+    if bot_durumu["calisiyor"]:
+        ticker_label.configure(text=f"🔄 Tarama devam ediyor... Tur #{bot_durumu['son_tur']}", text_color="#f1c40f")
+    elif bot_durumu["son_guncelleme"] != "Hiç çalışmadı":
+        s = bot_durumu["toplam_yeni"]
+        ticker_label.configure(text=f"✅ Son: {bot_durumu['son_guncelleme']} | K:{s['kadin']} E:{s['erkek']} Ç:{s['cocuk']} D:{s['defacto']}", text_color="#2ecc71")
+    root.after(2000, scroll_ticker)
+
+# ── SIDEBAR ──
+sidebar = ctk.CTkFrame(root, width=250, corner_radius=0, fg_color="#2c3e50")
+sidebar.pack(side="left", fill="y")
+sidebar.pack_propagate(False)
+
+ctk.CTkLabel(sidebar, text="🛍️ New In\nBot Panel", font=("Segoe UI", 24, "bold"), text_color="white").pack(pady=(30, 10))
+
+btn_dash      = ctk.CTkButton(sidebar, text="📊 Dashboard",      font=("Segoe UI", 14), anchor="w", corner_radius=6, command=lambda: secme_sayfasi("Dashboard"))
+btn_dash.pack(fill="x", padx=15, pady=5)
+btn_log       = ctk.CTkButton(sidebar, text="📜 Canlı Log",      font=("Segoe UI", 14), anchor="w", corner_radius=6, command=lambda: secme_sayfasi("Log"))
+btn_log.pack(fill="x", padx=15, pady=5)
+btn_benzerlik = ctk.CTkButton(sidebar, text="🔁 Benzerlik",      font=("Segoe UI", 14), anchor="w", corner_radius=6, command=lambda: secme_sayfasi("Benzerlik"))
+btn_benzerlik.pack(fill="x", padx=15, pady=5)
+btn_ai        = ctk.CTkButton(sidebar, text="�� AI Analiz",      font=("Segoe UI", 14), anchor="w", corner_radius=6, command=lambda: secme_sayfasi("AI"))
+btn_ai.pack(fill="x", padx=15, pady=5)
+btn_markalar  = ctk.CTkButton(sidebar, text="🏷️ Markalar",      font=("Segoe UI", 14), anchor="w", corner_radius=6, command=lambda: secme_sayfasi("Markalar"))
+btn_markalar.pack(fill="x", padx=15, pady=5)
+btn_ayarlar   = ctk.CTkButton(sidebar, text="⚙️ Ayarlar",       font=("Segoe UI", 14), anchor="w", corner_radius=6, command=lambda: secme_sayfasi("Ayarlar"))
+btn_ayarlar.pack(fill="x", padx=15, pady=5)
+
+menu_butonlari = [btn_dash, btn_log, btn_benzerlik, btn_ai, btn_markalar, btn_ayarlar]
+
+bottom_sidebar = ctk.CTkFrame(sidebar, fg_color="transparent")
+bottom_sidebar.pack(side="bottom", fill="x", pady=20)
+
+zamanlayici_lbl = ctk.CTkLabel(bottom_sidebar, text="⏳ Zamanlayıcı: Kapalı", font=("Segoe UI", 11), text_color="#f1c40f")
+zamanlayici_lbl.pack(padx=15, pady=(0, 5))
+
+def baslat_zamanlayici():
+    global zamanlayici_aktif
+    zamanlayici_aktif = True
+    zamanlayici_lbl.configure(text="⏳ Zamanlayıcı: AKTİF", text_color="#2ecc71")
+    log("⏰ Otomatik zamanlayıcı başlatıldı")
+    zamanlayici_dongusu()
+
+def durdur_zamanlayici():
+    global zamanlayici_aktif
+    zamanlayici_aktif = False
+    zamanlayici_lbl.configure(text="⏳ Zamanlayıcı: Kapalı", text_color="#e74c3c")
+    log("⏰ Zamanlayıcı durduruldu")
+
+def hemen_calistir():
+    if bot_durumu["calisiyor"]:
+        messagebox.showinfo("Uyarı", "Bot zaten çalışıyor!")
+        return
+    tur_sayaci[0] += 1
+    threading.Thread(target=tek_tur_thread, args=(tur_sayaci[0],), daemon=True).start()
+
+ctk.CTkButton(bottom_sidebar, text="▶️ Zamanlayıcı Başlat", font=("Segoe UI", 12, "bold"), fg_color="#27ae60", command=baslat_zamanlayici).pack(fill="x", padx=15, pady=3)
+ctk.CTkButton(bottom_sidebar, text="⏹️ Zamanlayıcı Durdur", font=("Segoe UI", 12, "bold"), fg_color="#c0392b", command=durdur_zamanlayici).pack(fill="x", padx=15, pady=3)
+ctk.CTkButton(bottom_sidebar, text="🚀 Hemen Çalıştır", font=("Segoe UI", 12, "bold"), fg_color="#8e44ad", command=hemen_calistir).pack(fill="x", padx=15, pady=3)
+
+# ── CONTENT AREA ──
+content_area = ctk.CTkFrame(root, corner_radius=0, fg_color="#181b1f")
+content_area.pack(side="right", fill="both", expand=True)
+
+top_header = ctk.CTkFrame(content_area, fg_color="transparent", height=70)
+ctk.CTkLabel(top_header, text="📊 Marka Durumları", font=("Segoe UI", 28, "bold"), text_color="white").pack(side="left")
+
+# ── FRAMES ──
+frame_dashboard = ctk.CTkFrame(content_area, fg_color="transparent")
+frame_log       = ctk.CTkFrame(content_area, fg_color="transparent")
+frame_benzerlik = ctk.CTkFrame(content_area, fg_color="transparent")
+frame_ai        = ctk.CTkFrame(content_area, fg_color="transparent")
+frame_markalar  = ctk.CTkFrame(content_area, fg_color="transparent")
+frame_ayarlar   = ctk.CTkFrame(content_area, fg_color="transparent")
+
+tum_frameler = [frame_dashboard, frame_log, frame_benzerlik, frame_ai, frame_markalar, frame_ayarlar]
+
+def secme_sayfasi(sayfa_adi):
+    for frame in tum_frameler:
+        frame.pack_forget()
+    for btn in menu_butonlari:
+        btn.configure(fg_color="transparent")
+    if sayfa_adi == "Dashboard":
+        top_header.pack(fill="x", padx=20, pady=(20, 0))
+        frame_dashboard.pack(fill="both", expand=True)
+        btn_dash.configure(fg_color="#3498db")
+        guncelle_dashboard_kartlari()
+    else:
+        top_header.pack_forget()
+        if sayfa_adi == "Log":
+            frame_log.pack(fill="both", expand=True)
+            btn_log.configure(fg_color="#3498db")
+            _log_ui_guncelle()
+        elif sayfa_adi == "Benzerlik":
+            frame_benzerlik.pack(fill="both", expand=True)
+            btn_benzerlik.configure(fg_color="#3498db")
+            guncelle_benzerlik_listesi()
+        elif sayfa_adi == "AI":
+            frame_ai.pack(fill="both", expand=True)
+            btn_ai.configure(fg_color="#3498db")
+            guncelle_ai_sayfasi()
+        elif sayfa_adi == "Markalar":
+            frame_markalar.pack(fill="both", expand=True)
+            btn_markalar.configure(fg_color="#3498db")
+            guncelle_marka_listesi()
+        elif sayfa_adi == "Ayarlar":
+            frame_ayarlar.pack(fill="both", expand=True)
+            btn_ayarlar.configure(fg_color="#3498db")
+
+
+# ═══ DASHBOARD ═══
+CINSIYET_RENK = {"kadin": "#e91e63", "erkek": "#2196f3", "cocuk": "#4caf50"}
+
+dash_scroll = ctk.CTkScrollableFrame(frame_dashboard, fg_color="transparent")
+dash_scroll.pack(fill="both", expand=True, padx=0, pady=0)
+
+_detay_img_refs = []  # Görsel referanslarını GC'den korur
+
+
+# ── Dashboard yardımcı fonksiyonlar ──
+
+def _en_aktif_marka() -> str:
+    """En çok yeni ürün bulunan markanın kısa adını döndür."""
+    en = max(
+        ((ad, d.get("yeni", 0)) for ad, d in bot_durumu["marka_durumlari"].items()),
+        key=lambda x: x[1], default=("—", 0))
+    if en[1] == 0:
+        return "—"
+    for isim in ["Zara", "Defacto", "Massimo Dutti", "MD", "Stradivarius", "Bershka",
+                 "YSL", "Uniqlo", "Aritzia", "Brandy"]:
+        if isim.lower() in en[0].lower():
+            return isim
+    return en[0][:12]
+
+
+def _haftalik_degisim() -> str:
+    """Bu hafta ile geçen haftanın toplamını karşılaştır."""
+    veri = haftalik_yukle()
+    if len(veri) < 2:
+        return "—"
+    anahtarlar = sorted(veri.keys())
+    bu_hafta = veri[anahtarlar[-1]]
+    gecen_hafta = veri[anahtarlar[-2]]
+    if gecen_hafta == 0:
+        return "—"
+    oran = (bu_hafta - gecen_hafta) / gecen_hafta * 100
+    isaret = "+" if oran >= 0 else ""
+    return f"{isaret}{oran:.1f}%"
+
+
+def _son_eklenen_urunler(n: int = 16) -> list:
+    """Son eklenen ürünlerin ilk n tanesini döndür.
+    İlk turda henüz son_eklenenler boşsa urun_listesi'nden resimli örnekler al."""
+    son = bot_durumu.get("son_eklenenler", [])
+    if son:
+        return son[:n]
+    # Fallback: resimli ürünleri urun_listesi'nden topla
+    fallback = []
+    for ad, urunler in bot_durumu.get("urun_listesi", {}).items():
+        for u in (urunler or []):
+            g = u.get("gorsel", "")
+            if g and g.startswith("http"):
+                uc = dict(u)
+                uc["marka_ad"] = ad
+                fallback.append(uc)
+                if len(fallback) >= n:
+                    return fallback
+    return fallback
+
+
+def _ciz_cizgi_grafik(parent):
+    """Haftalık yeni ürün trendi — tk.Canvas ile çiz."""
+    W, H = 520, 180
+    canvas = tk.Canvas(parent, width=W, height=H, bg="#1e272e", highlightthickness=0)
+    canvas.pack(padx=15, pady=(0, 15))
+
+    veri = haftalik_yukle()
+    anahtarlar = sorted(veri.keys())[-8:]
+    degerler = [veri.get(k, 0) for k in anahtarlar]
+    if not degerler or max(degerler) == 0:
+        canvas.create_text(W//2, H//2, text="Veri yok — ilk tur tamamlandıktan sonra görünecek",
+                           fill="#7f8c8d", font=("Segoe UI", 10))
+        return
+
+    PAD_L, PAD_R, PAD_T, PAD_B = 40, 10, 10, 35
+    gW = W - PAD_L - PAD_R
+    gH = H - PAD_T - PAD_B
+    maks = max(degerler) or 1
+
+    # Grid çizgileri
+    for i in range(5):
+        y = PAD_T + gH - int(gH * i / 4)
+        canvas.create_line(PAD_L, y, W - PAD_R, y, fill="#2f3640", width=1)
+        canvas.create_text(PAD_L - 4, y, text=str(int(maks * i / 4)),
+                           fill="#7f8c8d", font=("Segoe UI", 8), anchor="e")
+
+    # Hafta etiketleri & koordinatlar
+    N = len(degerler)
+    pts = []
+    for i, (k, v) in enumerate(zip(anahtarlar, degerler)):
+        x = PAD_L + int(gW * i / max(N - 1, 1))
+        y = PAD_T + gH - int(gH * v / maks)
+        pts.append((x, y))
+        hafta = k.split("-W")[-1] if "-W" in k else k
+        canvas.create_text(x, H - PAD_B + 12, text=f"H{hafta}",
+                           fill="#7f8c8d", font=("Segoe UI", 8))
+
+    # Dolgu alanı
+    if len(pts) >= 2:
+        poly = [pts[0][0], PAD_T + gH]
+        for x, y in pts:
+            poly += [x, y]
+        poly += [pts[-1][0], PAD_T + gH]
+        canvas.create_polygon(poly, fill="#1a3352", outline="")
+
+    # Çizgi
+    for i in range(len(pts) - 1):
+        canvas.create_line(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1],
+                           fill="#e67e22", width=2)
+
+    # Noktalar
+    for x, y in pts:
+        canvas.create_oval(x-3, y-3, x+3, y+3, fill="#e67e22", outline="#f39c12")
+
+
+def _ciz_donut_grafik(parent):
+    """Marka dağılımı — tk.Canvas ile donut chart çiz."""
+    W, H = 300, 180
+    canvas = tk.Canvas(parent, width=W, height=H, bg="#1e272e", highlightthickness=0)
+    canvas.pack(padx=15, pady=(0, 15))
+
+    # Marka gruplarına göre toplam ürün sayısı
+    GRUPLAR = [
+        ("Zara", "#e67e22"), ("Defacto", "#e74c3c"), ("MD", "#9b59b6"),
+        ("Bershka", "#3498db"), ("Stradivarius", "#2ecc71"), ("Uniqlo", "#1abc9c"),
+        ("YSL", "#f1c40f"), ("Aritzia", "#e91e63"), ("Brandy", "#fd79a8"), ("Diğer", "#636e72"),
+    ]
+    grup_say = {g: 0 for g, _ in GRUPLAR}
+    for ad, d in bot_durumu["marka_durumlari"].items():
+        s = d.get("urun_sayisi", 0)
+        es = False
+        for g, _ in GRUPLAR:
+            if g.lower() in ad.lower():
+                grup_say[g] += s; es = True; break
+        if not es:
+            grup_say["Diğer"] += s
+
+    toplam = sum(grup_say.values()) or 1
+    aktif = [(g, s, c) for (g, c), s in zip(
+        {g: c for g, c in GRUPLAR}.items(), grup_say.values()) if s > 0]
+
+    cx, cy, R, r = W // 2 - 30, H // 2, 70, 42
+    start = -90.0
+    for g, s, c in aktif:
+        extent = 360.0 * s / toplam
+        canvas.create_arc(cx-R, cy-R, cx+R, cy+R, start=start, extent=extent,
+                          fill=c, outline="#1e272e", width=2, style="pieslice")
+        canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill="#1e272e", outline="#1e272e")
+        start += extent
+
+    canvas.create_text(cx, cy, text=str(toplam), font=("Segoe UI", 16, "bold"), fill="white")
+    canvas.create_text(cx, cy + 16, text="TOPLAM", font=("Segoe UI", 7), fill="#7f8c8d")
+
+    # Lejant
+    lx = W - 85
+    for i, (g, s, c) in enumerate(aktif[:8]):
+        ly = 15 + i * 20
+        canvas.create_rectangle(lx, ly, lx+10, ly+10, fill=c, outline="")
+        canvas.create_text(lx + 14, ly + 5, text=f"{g} {s}",
+                           fill="#bdc3c7", font=("Segoe UI", 8), anchor="w")
+
+
+def goster_marka_detay(marka_ad):
+    """Dashboard kartına tıklanınca resimli ürün detay penceresini aç."""
+    urunler = bot_durumu.get("urun_listesi", {}).get(marka_ad, [])
+    if not urunler:
+        messagebox.showinfo("Bilgi", f"'{marka_ad}' için ürün verisi yok.\nBotu çalıştırın.")
+        return
+    _ac_galeri(urunler, f"📦 {marka_ad}  —  {len(urunler)} ürün")
+
+
+def goster_tum_galeri():
+    """Tüm yeni ürünleri tek galeride göster."""
+    son = bot_durumu.get("son_eklenenler", [])
+    if not son:
+        # ilk turda urun_listesi'nden al
+        fallback = []
+        for ad, urunler in bot_durumu.get("urun_listesi", {}).items():
+            for u in (urunler or []):
+                uc = dict(u); uc["marka_ad"] = ad
+                fallback.append(uc)
+        if fallback:
+            _ac_galeri(fallback[:200], f"🛍️ Tüm Ürünler — {len(fallback)} ürün")
+            return
+        messagebox.showinfo("Bilgi", "Henüz yeni ürün yok.\nBotu çalıştırın.")
+        return
+    _ac_galeri(son, f"🛍️ Tüm Yeni Ürünler — {len(son)} ürün")
+
+
+def _ac_galeri(urunler, baslik):
+    """Resimli ürün galerisi penceresi aç."""
+    modal = ctk.CTkToplevel(root)
+    modal.title(baslik)
+    modal.geometry("1180x760")
+    modal.configure(fg_color="#181b1f")
+    modal.attributes("-topmost", True)
+
+    hdr = ctk.CTkFrame(modal, fg_color="#2c3e50", corner_radius=0, height=55)
+    hdr.pack(fill="x")
+    hdr.pack_propagate(False)
+    ctk.CTkLabel(hdr, text=baslik, font=("Segoe UI", 17, "bold"), text_color="white").pack(side="left", padx=20, pady=12)
+    ctk.CTkLabel(hdr, text=f"{len(urunler)} ürün", font=("Segoe UI", 12), text_color="#bdc3c7").pack(side="right", padx=20)
+
+    scroll_f = ctk.CTkScrollableFrame(modal, fg_color="transparent")
+    scroll_f.pack(fill="both", expand=True, padx=8, pady=8)
+
+    COLS = 4
+    for c in range(COLS):
+        scroll_f.grid_columnconfigure(c, weight=1)
+
+    for idx, urun in enumerate(urunler[:200]):
+        r, c = divmod(idx, COLS)
+        card = ctk.CTkFrame(scroll_f, fg_color="#1e272e", corner_radius=10,
+                            border_width=1, border_color="#2f3640", width=255, height=270)
+        card.grid(row=r, column=c, padx=5, pady=5, sticky="nsew")
+        card.grid_propagate(False)
+
+        gorsel = urun.get("gorsel", "")
+        link   = urun.get("link", "")
+        placeholder = "🖼️" if not gorsel else "⏳"
+        img_lbl = ctk.CTkLabel(card, text=placeholder, font=("Segoe UI", 24),
+                               fg_color="#151a1f", width=243, height=150, corner_radius=8,
+                               cursor="hand2" if link else "arrow")
+        img_lbl.place(x=6, y=6)
+
+        isim_lbl = ctk.CTkLabel(card, text=(urun.get("isim") or "—")[:38],
+                                font=("Segoe UI", 10, "bold"), text_color="white",
+                                wraplength=240, justify="left", anchor="w")
+        isim_lbl.place(x=8, y=160)
+
+        fiyat = (urun.get("fiyat") or "").strip()[:28]
+        ctk.CTkLabel(card, text=fiyat, font=("Segoe UI", 11, "bold"),
+                     text_color="#f1c40f", anchor="w").place(x=8, y=200)
+
+        if link:
+            btn = ctk.CTkButton(card, text="🔗 İncele", width=238, height=26, font=("Segoe UI", 10),
+                                fg_color="#2980b9", hover_color="#3498db",
+                                command=lambda l=link: webbrowser.open(l))
+            btn.place(x=8, y=232)
+            img_lbl.bind("<Button-1>", lambda e, l=link: webbrowser.open(l))
+
+        if gorsel and gorsel.startswith("http"):
+            from urllib.parse import urlparse as _up
+            _ref = gorsel.split("/")[0] + "//" + gorsel.split("/")[2] if gorsel.count("/") >= 2 else ""
+            def _load_img(url, lbl, mod, referer=_ref):
+                with _IMG_SEM:
+                    try:
+                        hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"}
+                        if referer:
+                            hdrs["Referer"] = referer
+                        resp = requests.get(url, timeout=10, headers=hdrs)
+                        if resp.status_code == 200 and resp.content:
+                            pil_img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
+                            pil_img.thumbnail((243, 150), PILImage.LANCZOS)
+                            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img,
+                                                   size=(pil_img.width, pil_img.height))
+                            _detay_img_refs.append(ctk_img)
+                            try:
+                                mod.after(0, lambda lb=lbl, ci=ctk_img: lb.configure(image=ci, text=""))
+                            except: pass
+                            return
+                    except: pass
+                    try: mod.after(0, lambda lb=lbl: lb.configure(text="🖼️", image=""))
+                    except: pass
+            threading.Thread(target=_load_img, args=(gorsel, img_lbl, modal), daemon=True).start()
+
+    modal.focus_force()
+
+
+def _urun_thumb_kart(parent, urun):
+    """Son eklenenler satırı için tek ürün thumbnail kartı."""
+    link   = urun.get("link", "")
+    gorsel = urun.get("gorsel", "")
+
+    card = ctk.CTkFrame(parent, fg_color="#252d35", corner_radius=10,
+                        border_width=1, border_color="#2f3640",
+                        width=140, height=210, cursor="hand2" if link else "arrow")
+    card.pack(side="left", padx=6, pady=4)
+    card.pack_propagate(False)
+
+    placeholder = "🖼️" if not gorsel else "⏳"
+    img_lbl = ctk.CTkLabel(card, text=placeholder, font=("Segoe UI", 18),
+                           fg_color="#1a2129", width=128, height=130,
+                           corner_radius=8, cursor="hand2" if link else "arrow")
+    img_lbl.pack(pady=(6, 2), padx=6)
+
+    isim = (urun.get("isim") or "—")[:22]
+    ctk.CTkLabel(card, text=isim, font=("Segoe UI", 9, "bold"), text_color="white",
+                 wraplength=128).pack(padx=5)
+    fiyat = (urun.get("fiyat") or "").strip()[:18]
+    ctk.CTkLabel(card, text=fiyat if fiyat else " ", font=("Segoe UI", 9, "bold"),
+                 text_color="#f1c40f").pack()
+
+    if link:
+        for w in (card, img_lbl):
+            w.bind("<Button-1>", lambda e, l=link: webbrowser.open(l))
+
+    if gorsel and gorsel.startswith("http"):
+        _ref = gorsel.split("/")[0] + "//" + gorsel.split("/")[2] if gorsel.count("/") >= 2 else ""
+        def _load(url, lbl, referer=_ref):
+            with _IMG_SEM:
+                try:
+                    hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"}
+                    if referer:
+                        hdrs["Referer"] = referer
+                    resp = requests.get(url, timeout=10, headers=hdrs)
+                    if resp.status_code == 200 and resp.content:
+                        pil_img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
+                        pil_img.thumbnail((128, 130), PILImage.LANCZOS)
+                        ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img,
+                                               size=(pil_img.width, pil_img.height))
+                        _detay_img_refs.append(ctk_img)
+                        try: root.after(0, lambda lb=lbl, ci=ctk_img: lb.configure(image=ci, text=""))
+                        except: pass
+                        return
+                except: pass
+                try: root.after(0, lambda lb=lbl: lb.configure(text="🖼️", image=""))
+                except: pass
+        threading.Thread(target=_load, args=(gorsel, img_lbl), daemon=True).start()
+
+
+def guncelle_dashboard_kartlari():
+    """Yeni dashboard: KPI satırı + grafikler + son eklenenler."""
+    for w in dash_scroll.winfo_children():
+        w.destroy()
+
+    toplam_yeni = sum(bot_durumu["toplam_yeni"].values())
+    toplam_urun = sum(d.get("urun_sayisi", 0) for d in bot_durumu["marka_durumlari"].values())
+
+    # ─── KPI Satırı ───
+    kpi_frame = ctk.CTkFrame(dash_scroll, fg_color="transparent")
+    kpi_frame.pack(fill="x", padx=15, pady=(15, 5))
+    for i in range(6):
+        kpi_frame.grid_columnconfigure(i, weight=1)
+
+    kpi_data = [
+        ("👥", str(len(MARKALAR)),              "Takip Edilen Marka"),
+        ("📦", str(toplam_yeni),                 "Bu Hafta Yeni Ürün"),
+        ("📈", _haftalik_degisim(),              "Haftalık Değişim"),
+        ("⚡", _en_aktif_marka(),                "En Aktif Marka"),
+        ("🛍️", str(toplam_urun),               "Toplam Ürün"),
+        ("🕐", bot_durumu["son_guncelleme"][-8:] if bot_durumu["son_guncelleme"] != "Hiç çalışmadı"
+               else "—",                         "Son Güncelleme"),
+    ]
+    for i, (icon, val, label) in enumerate(kpi_data):
+        c = ctk.CTkFrame(kpi_frame, fg_color="#1e272e", corner_radius=12,
+                         border_width=1, border_color="#2f3640")
+        c.grid(row=0, column=i, padx=5, sticky="nsew")
+        ctk.CTkLabel(c, text=f"{icon}  KPI", font=("Segoe UI", 9),
+                     text_color="#636e72").pack(anchor="e", padx=10, pady=(8, 0))
+        ctk.CTkLabel(c, text=val, font=("Segoe UI", 24, "bold"), text_color="white").pack(padx=10)
+        ctk.CTkLabel(c, text=label, font=("Segoe UI", 10), text_color="#bdc3c7").pack(padx=10, pady=(0, 10))
+
+    # ─── Grafik Satırı ───
+    chart_outer = ctk.CTkFrame(dash_scroll, fg_color="transparent")
+    chart_outer.pack(fill="x", padx=15, pady=5)
+    chart_outer.grid_columnconfigure(0, weight=3)
+    chart_outer.grid_columnconfigure(1, weight=2)
+
+    line_card = ctk.CTkFrame(chart_outer, fg_color="#1e272e", corner_radius=12,
+                             border_width=1, border_color="#2f3640")
+    line_card.grid(row=0, column=0, padx=(0, 6), sticky="nsew")
+    ctk.CTkLabel(line_card, text="Haftalık Yeni Ürün Trendi",
+                 font=("Segoe UI", 13, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(12, 4))
+    _ciz_cizgi_grafik(line_card)
+
+    donut_card = ctk.CTkFrame(chart_outer, fg_color="#1e272e", corner_radius=12,
+                              border_width=1, border_color="#2f3640")
+    donut_card.grid(row=0, column=1, padx=(6, 0), sticky="nsew")
+    ctk.CTkLabel(donut_card, text="Marka Dağılımı",
+                 font=("Segoe UI", 13, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(12, 4))
+    _ciz_donut_grafik(donut_card)
+
+    # ─── Son Eklenen Ürünler ───
+    son_card = ctk.CTkFrame(dash_scroll, fg_color="#1e272e", corner_radius=12,
+                            border_width=1, border_color="#2f3640")
+    son_card.pack(fill="x", padx=15, pady=(5, 15))
+
+    hdr2 = ctk.CTkFrame(son_card, fg_color="transparent")
+    hdr2.pack(fill="x", padx=20, pady=(12, 4))
+    ctk.CTkLabel(hdr2, text="Son Eklenen Ürünler",
+                 font=("Segoe UI", 13, "bold"), text_color="white").pack(side="left")
+    ctk.CTkButton(hdr2, text="Tümünü Gör →", font=("Segoe UI", 11),
+                  fg_color="transparent", text_color="#e67e22",
+                  hover_color="#2f3640", border_width=0,
+                  command=goster_tum_galeri).pack(side="right")
+
+    son_urunler = _son_eklenen_urunler(16)
+    if son_urunler:
+        thumb_frame = ctk.CTkScrollableFrame(son_card, fg_color="transparent",
+                                             height=215, orientation="horizontal")
+        thumb_frame.pack(fill="x", padx=10, pady=(0, 12))
+        for u in son_urunler:
+            _urun_thumb_kart(thumb_frame, u)
+    else:
+        ctk.CTkLabel(son_card, text="Henüz tarama yapılmadı veya yeni ürün yok.",
+                     font=("Segoe UI", 13), text_color="#636e72").pack(pady=25)
+
+    # ─── Marka Kartları Izgara ───
+    kartlar_baslik = ctk.CTkFrame(dash_scroll, fg_color="transparent")
+    kartlar_baslik.pack(fill="x", padx=15, pady=(5, 0))
+    ctk.CTkLabel(kartlar_baslik, text="Marka Durumları",
+                 font=("Segoe UI", 13, "bold"), text_color="white").pack(side="left")
+
+    if not bot_durumu["marka_durumlari"]:
+        ctk.CTkLabel(dash_scroll, text="Hemen Çalıştır butonuna tıklayın.",
+                     font=("Segoe UI", 14), text_color="#7f8c8d").pack(pady=20)
+        return
+
+    grid_f = ctk.CTkFrame(dash_scroll, fg_color="transparent")
+    grid_f.pack(fill="x", padx=15, pady=(5, 15))
+    for i in range(5):
+        grid_f.grid_columnconfigure(i, weight=1)
+
+    row, col = 0, 0
+    for marka in MARKALAR:
+        ad = marka["ad"]
+        durum = bot_durumu["marka_durumlari"].get(ad, {})
+        if not durum:
+            continue
+        cinsiyet = marka.get("cinsiyet", "kadin")
+        urun_say = durum.get("urun_sayisi", 0)
+        yeni_say = durum.get("yeni", 0)
+        hata = durum.get("hata", "")
+        renk = CINSIYET_RENK.get(cinsiyet, "#888")
+        card = ctk.CTkFrame(grid_f, fg_color="#1e272e", corner_radius=10,
+                            border_width=2, border_color=renk if not hata else "#e74c3c",
+                            cursor="hand2")
+        card.grid(row=row, column=col, padx=6, pady=6, sticky="nsew")
+        lbl_ad = ctk.CTkLabel(card, text=ad[:22], font=("Segoe UI", 10, "bold"),
+                              text_color="white", wraplength=170, cursor="hand2")
+        lbl_ad.pack(padx=8, pady=(8, 1))
+        lbl_say = ctk.CTkLabel(card, text=f"{urun_say} ürün",
+                               font=("Segoe UI", 18, "bold"), text_color="white", cursor="hand2")
+        lbl_say.pack(padx=8)
+        if hata:
+            lbl_alt = ctk.CTkLabel(card, text=f"❌ {hata[:28]}", font=("Segoe UI", 8),
+                                   text_color="#e74c3c", cursor="hand2")
+        elif yeni_say > 0:
+            lbl_alt = ctk.CTkLabel(card, text=f"🆕 {yeni_say} yeni",
+                                   font=("Segoe UI", 11, "bold"), text_color="#2ecc71", cursor="hand2")
+        else:
+            lbl_alt = ctk.CTkLabel(card, text="— yeni yok", font=("Segoe UI", 9),
+                                   text_color="#7f8c8d", cursor="hand2")
+        lbl_alt.pack(padx=8, pady=(0, 7))
+        for widget in (card, lbl_ad, lbl_say, lbl_alt):
+            widget.bind("<Button-1>", lambda e, brand=ad: goster_marka_detay(brand))
+        col += 1
+        if col >= 5:
+            col = 0
+            row += 1
+
+
+# ═══ LOG ═══
+ctk.CTkLabel(frame_log, text="📜 Canlı Çalışma Logu", font=("Segoe UI", 24, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(20, 10))
+log_textbox = ctk.CTkTextbox(frame_log, font=("Consolas", 13), fg_color="#1e272e", wrap="word")
+log_textbox.pack(fill="both", expand=True, padx=20, pady=10)
+log_textbox.insert("0.0", "Bot başlatıldığında loglar burada görünecek...\n")
+log_textbox.configure(state="disabled")
+
+
+# ═══ BENZERLİK ═══
+ctk.CTkLabel(frame_benzerlik, text="🔁 Benzerlik Analizi Sonuçları", font=("Segoe UI", 24, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(20, 10))
+benzerlik_scroll = ctk.CTkScrollableFrame(frame_benzerlik, fg_color="transparent")
+benzerlik_scroll.pack(fill="both", expand=True, padx=10, pady=10)
+
+def guncelle_benzerlik_listesi():
+    for w in benzerlik_scroll.winfo_children():
+        w.destroy()
+    sonuclar = bot_durumu["benzerlik_sonuclari"]
+    if not sonuclar:
+        ctk.CTkLabel(benzerlik_scroll, text="Henüz benzerlik sonucu yok.", font=("Segoe UI", 14), text_color="#7f8c8d").pack(pady=40)
+        return
+    for s in sorted(sonuclar, key=lambda x: -x["skor"]):
+        skor = s["skor"]
+        pct = int(skor * 100)
+        if skor >= 0.95:   renk = "#2ecc71"; etiket = "🟢 AYNI"
+        elif skor >= 0.85: renk = "#e74c3c"; etiket = "🚨 ACİL"
+        elif skor >= 0.75: renk = "#f1c40f"; etiket = "🟡 Çok Benzer"
+        else:              renk = "#e67e22"; etiket = "🟠 Benzer"
+        satir = ctk.CTkFrame(benzerlik_scroll, fg_color="#1e272e", corner_radius=8, border_width=1, border_color=renk)
+        satir.pack(fill="x", pady=5, padx=10)
+        ctk.CTkLabel(satir, text=f"{etiket} %{pct}", font=("Segoe UI", 14, "bold"), text_color=renk, width=150).pack(side="left", padx=15, pady=12)
+        ctk.CTkLabel(satir, text=f"🍎 {s['defacto'][:40]}", font=("Segoe UI", 12), text_color="white").pack(side="left", padx=10)
+        ctk.CTkLabel(satir, text="↔", font=("Segoe UI", 14, "bold"), text_color="#7f8c8d").pack(side="left", padx=5)
+        ctk.CTkLabel(satir, text=f"🛍️ {s['hedef'][:40]}", font=("Segoe UI", 12), text_color="white").pack(side="left", padx=10)
+        ctk.CTkLabel(satir, text=f"[{s['cinsiyet'].title()}]", font=("Segoe UI", 10), text_color="#95a5a6").pack(side="right", padx=15)
+
+
+# ═══ AI ANALİZ ═══
+ctk.CTkLabel(frame_ai, text="🤖 Gemini AI Analiz", font=("Segoe UI", 24, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(20, 10))
+
+ai_sonuc_box = ctk.CTkTextbox(frame_ai, font=("Segoe UI", 13), fg_color="#1e272e", wrap="word", height=300)
+ai_sonuc_box.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+ai_sonuc_box.insert("0.0", "Tarama sonrası AI analizi otomatik olarak burada görünecek...\n\nAyrıca aşağıdaki kutuya soru yazarak Gemini AI'a sorabilirsiniz.")
+ai_sonuc_box.configure(state="disabled")
+
+ai_soru_frame = ctk.CTkFrame(frame_ai, fg_color="#1e272e", corner_radius=10)
+ai_soru_frame.pack(fill="x", padx=20, pady=10)
+ctk.CTkLabel(ai_soru_frame, text="💬 AI'a Soru Sor:", font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=15, pady=(10, 5))
+ai_soru_entry = ctk.CTkEntry(ai_soru_frame, font=("Segoe UI", 13), placeholder_text="Örn: Defacto hangi kategorilere yatırım yapmalı?")
+ai_soru_entry.pack(fill="x", padx=15, pady=(0, 5))
+
+def ai_soru_gonder():
+    soru = ai_soru_entry.get().strip()
+    if not soru:
+        return
+    ai_soru_entry.delete(0, "end")
+    ai_sonuc_box.configure(state="normal")
+    ai_sonuc_box.insert("end", f"\n\n{'='*50}\n💬 Soru: {soru}\n⏳ Yanıt bekleniyor...\n")
+    ai_sonuc_box.see("end")
+    ai_sonuc_box.configure(state="disabled")
+    kontekst = f"""Mevcut tarama verisi:
+- İzlenen marka sayısı: {len(MARKALAR)}
+- Son güncelleme: {bot_durumu['son_guncelleme']}
+- Son tur yeni ürünler: Kadın:{bot_durumu['toplam_yeni'].get('kadin',0)} Erkek:{bot_durumu['toplam_yeni'].get('erkek',0)} Çocuk:{bot_durumu['toplam_yeni'].get('cocuk',0)} Defacto:{bot_durumu['toplam_yeni'].get('defacto',0)}
+- Benzerlik eşleşmesi: {len(bot_durumu['benzerlik_sonuclari'])}
+
+Kullanıcı sorusu: {soru}
+
+Türkçe cevap ver. Moda perakende uzmanı gibi cevapla."""
+    def cb(cevap):
+        ai_sonuc_box.configure(state="normal")
+        ai_sonuc_box.insert("end", f"\n🤖 Gemini:\n{cevap}\n")
+        ai_sonuc_box.see("end")
+        ai_sonuc_box.configure(state="disabled")
+    ai_soru_sor_thread(kontekst, cb)
+
+ctk.CTkButton(ai_soru_frame, text="�� Gönder", font=("Segoe UI", 13, "bold"), fg_color="#8e44ad", command=ai_soru_gonder).pack(anchor="e", padx=15, pady=(0, 10))
+
+def guncelle_ai_sayfasi():
+    ai_sonuc_box.configure(state="normal")
+    if bot_durumu["ai_sonuc"]:
+        ai_sonuc_box.delete("0.0", "end")
+        ai_sonuc_box.insert("0.0", f"🤖 Son AI Analizi ({bot_durumu['son_guncelleme']}):\n{'='*50}\n\n{bot_durumu['ai_sonuc']}")
+    ai_sonuc_box.configure(state="disabled")
+
+
+# ═══ MARKALAR ═══
+ctk.CTkLabel(frame_markalar, text="🏷️ İzlenen Markalar", font=("Segoe UI", 24, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(20, 10))
+marka_scroll = ctk.CTkScrollableFrame(frame_markalar, fg_color="transparent")
+marka_scroll.pack(fill="both", expand=True, padx=10, pady=10)
+
+def guncelle_marka_listesi():
+    for w in marka_scroll.winfo_children():
+        w.destroy()
+    for m in MARKALAR:
+        satir = ctk.CTkFrame(marka_scroll, fg_color="#1e272e", corner_radius=6, height=40)
+        satir.pack(fill="x", pady=3, padx=10)
+        satir.pack_propagate(False)
+        renk = CINSIYET_RENK.get(m.get("cinsiyet", "kadin"), "#888")
+        ctk.CTkLabel(satir, text="●", font=("Segoe UI", 14), text_color=renk).pack(side="left", padx=(10, 5))
+        ctk.CTkLabel(satir, text=m["ad"], font=("Segoe UI", 12), text_color="white").pack(side="left", padx=5)
+        ctk.CTkLabel(satir, text=f"[{m['tip']}]", font=("Segoe UI", 10), text_color="#7f8c8d").pack(side="left", padx=10)
+        ctk.CTkLabel(satir, text=ulke_bul(m["ad"]), font=("Segoe UI", 10), text_color="#95a5a6").pack(side="right", padx=15)
+        lnk = ctk.CTkLabel(satir, text="🔗", font=("Segoe UI", 14), cursor="hand2")
+        lnk.pack(side="right", padx=5)
+        lnk.bind("<Button-1>", lambda e, url=m["url"]: webbrowser.open(url))
+
+
+# ═══ AYARLAR ═══
+ctk.CTkLabel(frame_ayarlar, text="⚙️ Bot Ayarları", font=("Segoe UI", 24, "bold"), text_color="white").pack(anchor="w", padx=20, pady=(20, 10))
+ayar = ctk.CTkFrame(frame_ayarlar, fg_color="#1e272e", corner_radius=10)
+ayar.pack(fill="x", padx=20, pady=10)
+ctk.CTkLabel(ayar, text="Çalışma Saatleri:", font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=20, pady=(15, 5))
+ctk.CTkLabel(ayar, text="  |  ".join(s.strftime("%H:%M") for s in CALISMA_SAATLERI), font=("Segoe UI", 16), text_color="#f1c40f").pack(anchor="w", padx=20, pady=(0, 10))
+ctk.CTkLabel(ayar, text=f"Marka: {len(MARKALAR)} | Cache: {CACHE_FILE} | Excel: {EXCEL_FILE}", font=("Segoe UI", 12), text_color="#95a5a6").pack(anchor="w", padx=20, pady=(5, 5))
+ctk.CTkLabel(ayar, text=f"Gemini API: {'✅ Ayarlanmış' if GEMINI_API_KEY else '❌ Yok'}", font=("Segoe UI", 12), text_color="#95a5a6").pack(anchor="w", padx=20, pady=(5, 15))
+
+def cache_sifirla():
+    if messagebox.askyesno("Cache Sıfırla", "Tüm ürün cache'i silinecek. Devam?"):
+        if os.path.exists(CACHE_FILE):
+            os.remove(CACHE_FILE)
+            log("🗑️ Cache sıfırlandı")
+        messagebox.showinfo("Tamam", "Cache silindi.")
+
+def csv_aktar():
+    if not bot_durumu["marka_durumlari"]:
+        messagebox.showinfo("Bilgi", "Dışa aktarılacak veri yok.")
+        return
+    yol = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+    if yol:
+        with open(yol, 'w', newline='', encoding='utf-8-sig') as f:
+            w = csv.writer(f, delimiter=';')
+            w.writerow(["Marka", "Ülke", "Cinsiyet", "Ürün Sayısı", "Yeni", "Hata", "Tarih"])
+            for m in MARKALAR:
+                d = bot_durumu["marka_durumlari"].get(m["ad"], {})
+                w.writerow([m["ad"], ulke_bul(m["ad"]), m.get("cinsiyet", ""), d.get("urun_sayisi", 0), d.get("yeni", 0), d.get("hata", ""), bot_durumu["son_guncelleme"]])
+        messagebox.showinfo("Başarılı", f"Rapor: {yol}")
+
+ctk.CTkButton(ayar, text="🗑️ Cache Sıfırla", fg_color="#c0392b", command=cache_sifirla).pack(anchor="w", padx=20, pady=5)
+ctk.CTkButton(ayar, text="📥 CSV Rapor", fg_color="#8e44ad", command=csv_aktar).pack(anchor="w", padx=20, pady=5)
+
+
+# ── STATUS BAR ──
+status_frame = ctk.CTkFrame(root, height=25, corner_radius=0, fg_color="#111111")
+status_frame.pack(side="bottom", fill="x")
+status_label = ctk.CTkLabel(status_frame, text=f"Hazır — {len(MARKALAR)} marka izleniyor", font=("Segoe UI", 10))
+status_label.pack(side="right", padx=20)
+
+# ── BAŞLAT ──
+secme_sayfasi("Dashboard")
+root.after(1000, scroll_ticker)
+root.mainloop()
