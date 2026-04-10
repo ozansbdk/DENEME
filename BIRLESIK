@@ -86,6 +86,8 @@ bot_durumu = {
 }
 
 
+_IMG_SEM = threading.Semaphore(8)  # max 8 eş zamanlı resim indirme
+
 # ── Marka listesi (v14 birebir — TÜM ülkeler dahil) ───────
 MARKALAR = [
     # ═══ ZARA KADIN ═══
@@ -769,10 +771,22 @@ def zara_api_cek(marka_url: str, accept_lang: str) -> list:
             gorsel = ""
             for media in (prod.get("xmedia") or prod.get("images") or []):
                 if isinstance(media, dict):
-                    raw = media.get("url", "") or media.get("path", "")
+                    raw = media.get("url", "")
                     if raw:
-                        gorsel = (raw if raw.startswith("http") else "https:" + raw)
-                        gorsel = gorsel.split("?")[0] + "?ts=1&w=600&f=auto"
+                        if raw.startswith("//"):
+                            gorsel = "https:" + raw.split("?")[0] + "?ts=1&w=600&f=auto"
+                        elif raw.startswith("http"):
+                            gorsel = raw.split("?")[0] + "?ts=1&w=600&f=auto"
+                        else:
+                            gorsel = ("https://static.zara.net" + ("" if raw.startswith("/") else "/assets/public/") + raw).split("?")[0] + "?ts=1&w=600&f=auto"
+                    else:
+                        path = media.get("path", "")
+                        name = media.get("name", "") or (path.split("/")[-1] + ".jpg" if path else "")
+                        ts   = media.get("timestamp", "1")
+                        if path:
+                            base = "https://static.zara.net/assets/public/" + path.lstrip("/")
+                            gorsel = f"{base}/{name}?ts={ts}&w=600&f=auto" if name and not path.endswith(name) else f"{base}?ts={ts}&w=600&f=auto"
+                    if gorsel:
                         break
             price_obj = prod.get("price") or {}
             if isinstance(price_obj, dict):
@@ -853,7 +867,16 @@ def inditex_api_cek(marka_url: str, accept_lang: str) -> list:
                 if isinstance(media, dict):
                     raw = media.get("url", "") or media.get("path", "")
                     if raw:
-                        gorsel = (raw if raw.startswith("http") else "https:" + raw)
+                        if raw.startswith("http"):
+                            gorsel = raw
+                        elif raw.startswith("//"):
+                            gorsel = "https:" + raw
+                        elif raw.startswith("/"):
+                            cdn = origin.replace("://www.", "://static.").replace(".com", ".net")
+                            gorsel = cdn + raw
+                        else:
+                            cdn = origin.replace("://www.", "://static.").replace(".com", ".net")
+                            gorsel = cdn + "/" + raw
                         gorsel = gorsel.split("?")[0] + "?w=600"
                         break
             price_obj = prod.get("price") or {}
@@ -1591,9 +1614,24 @@ def _haftalik_degisim() -> str:
     return f"{isaret}{oran:.1f}%"
 
 
-def _son_eklenen_urunler(n: int = 12) -> list:
-    """Son eklenen ürünlerin ilk n tanesini döndür."""
-    return bot_durumu.get("son_eklenenler", [])[:n]
+def _son_eklenen_urunler(n: int = 16) -> list:
+    """Son eklenen ürünlerin ilk n tanesini döndür.
+    İlk turda henüz son_eklenenler boşsa urun_listesi'nden resimli örnekler al."""
+    son = bot_durumu.get("son_eklenenler", [])
+    if son:
+        return son[:n]
+    # Fallback: resimli ürünleri urun_listesi'nden topla
+    fallback = []
+    for ad, urunler in bot_durumu.get("urun_listesi", {}).items():
+        for u in (urunler or []):
+            g = u.get("gorsel", "")
+            if g and g.startswith("http"):
+                uc = dict(u)
+                uc["marka_ad"] = ad
+                fallback.append(uc)
+                if len(fallback) >= n:
+                    return fallback
+    return fallback
 
 
 def _ciz_cizgi_grafik(parent):
@@ -1711,6 +1749,15 @@ def goster_tum_galeri():
     """Tüm yeni ürünleri tek galeride göster."""
     son = bot_durumu.get("son_eklenenler", [])
     if not son:
+        # ilk turda urun_listesi'nden al
+        fallback = []
+        for ad, urunler in bot_durumu.get("urun_listesi", {}).items():
+            for u in (urunler or []):
+                uc = dict(u); uc["marka_ad"] = ad
+                fallback.append(uc)
+        if fallback:
+            _ac_galeri(fallback[:200], f"🛍️ Tüm Ürünler — {len(fallback)} ürün")
+            return
         messagebox.showinfo("Bilgi", "Henüz yeni ürün yok.\nBotu çalıştırın.")
         return
     _ac_galeri(son, f"🛍️ Tüm Yeni Ürünler — {len(son)} ürün")
@@ -1744,9 +1791,12 @@ def _ac_galeri(urunler, baslik):
         card.grid(row=r, column=c, padx=5, pady=5, sticky="nsew")
         card.grid_propagate(False)
 
-        img_lbl = ctk.CTkLabel(card, text="⏳", font=("Segoe UI", 24),
+        gorsel = urun.get("gorsel", "")
+        link   = urun.get("link", "")
+        placeholder = "🖼️" if not gorsel else "⏳"
+        img_lbl = ctk.CTkLabel(card, text=placeholder, font=("Segoe UI", 24),
                                fg_color="#151a1f", width=243, height=150, corner_radius=8,
-                               cursor="hand2")
+                               cursor="hand2" if link else "arrow")
         img_lbl.place(x=6, y=6)
 
         isim_lbl = ctk.CTkLabel(card, text=(urun.get("isim") or "—")[:38],
@@ -1758,81 +1808,93 @@ def _ac_galeri(urunler, baslik):
         ctk.CTkLabel(card, text=fiyat, font=("Segoe UI", 11, "bold"),
                      text_color="#f1c40f", anchor="w").place(x=8, y=200)
 
-        link = urun.get("link", "")
         if link:
             btn = ctk.CTkButton(card, text="🔗 İncele", height=26, font=("Segoe UI", 10),
                                 fg_color="#2980b9", hover_color="#3498db",
                                 command=lambda l=link: webbrowser.open(l))
             btn.place(x=8, y=232, width=238)
+            img_lbl.bind("<Button-1>", lambda e, l=link: webbrowser.open(l))
 
-        gorsel = urun.get("gorsel", "")
         if gorsel and gorsel.startswith("http"):
-            def _load_img(url, lbl, mod):
-                try:
-                    resp = requests.get(url, timeout=7, headers={"User-Agent": "Mozilla/5.0"})
-                    pil_img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
-                    pil_img.thumbnail((243, 150), PILImage.LANCZOS)
-                    ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img,
-                                           size=(pil_img.width, pil_img.height))
-                    _detay_img_refs.append(ctk_img)
+            from urllib.parse import urlparse as _up
+            _ref = gorsel.split("/")[0] + "//" + gorsel.split("/")[2] if gorsel.count("/") >= 2 else ""
+            def _load_img(url, lbl, mod, referer=_ref):
+                with _IMG_SEM:
                     try:
-                        mod.after(0, lambda lb=lbl, ci=ctk_img: lb.configure(image=ci, text=""))
+                        hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"}
+                        if referer:
+                            hdrs["Referer"] = referer
+                        resp = requests.get(url, timeout=10, headers=hdrs)
+                        if resp.status_code == 200 and resp.content:
+                            pil_img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
+                            pil_img.thumbnail((243, 150), PILImage.LANCZOS)
+                            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img,
+                                                   size=(pil_img.width, pil_img.height))
+                            _detay_img_refs.append(ctk_img)
+                            try:
+                                mod.after(0, lambda lb=lbl, ci=ctk_img: lb.configure(image=ci, text=""))
+                            except: pass
+                            return
                     except: pass
-                except:
-                    try: mod.after(0, lambda lb=lbl: lb.configure(text="🖼️"))
+                    try: mod.after(0, lambda lb=lbl: lb.configure(text="🖼️", image=""))
                     except: pass
             threading.Thread(target=_load_img, args=(gorsel, img_lbl, modal), daemon=True).start()
-
-        # Görsel tıklanabilir
-        if link:
-            img_lbl.bind("<Button-1>", lambda e, l=link: webbrowser.open(l))
 
     modal.focus_force()
 
 
 def _urun_thumb_kart(parent, urun):
     """Son eklenenler satırı için tek ürün thumbnail kartı."""
+    link   = urun.get("link", "")
+    gorsel = urun.get("gorsel", "")
+
     card = ctk.CTkFrame(parent, fg_color="#252d35", corner_radius=10,
                         border_width=1, border_color="#2f3640",
-                        width=140, height=200, cursor="hand2")
+                        width=140, height=210, cursor="hand2" if link else "arrow")
     card.pack(side="left", padx=6, pady=4)
     card.pack_propagate(False)
 
-    img_lbl = ctk.CTkLabel(card, text="⏳", font=("Segoe UI", 18),
+    placeholder = "🖼️" if not gorsel else "⏳"
+    img_lbl = ctk.CTkLabel(card, text=placeholder, font=("Segoe UI", 18),
                            fg_color="#1a2129", width=128, height=130,
-                           corner_radius=8, cursor="hand2")
-    img_lbl.pack(pady=(6, 4), padx=6)
+                           corner_radius=8, cursor="hand2" if link else "arrow")
+    img_lbl.pack(pady=(6, 2), padx=6)
 
     isim = (urun.get("isim") or "—")[:22]
     ctk.CTkLabel(card, text=isim, font=("Segoe UI", 9, "bold"), text_color="white",
                  wraplength=128).pack(padx=5)
     fiyat = (urun.get("fiyat") or "").strip()[:18]
-    if fiyat:
-        ctk.CTkLabel(card, text=fiyat, font=("Segoe UI", 9, "bold"),
-                     text_color="#f1c40f").pack()
-
-    link = urun.get("link", "")
-    gorsel = urun.get("gorsel", "")
-
-    if gorsel and gorsel.startswith("http"):
-        def _load(url, lbl):
-            try:
-                resp = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
-                pil_img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
-                pil_img.thumbnail((128, 130), PILImage.LANCZOS)
-                ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img,
-                                       size=(pil_img.width, pil_img.height))
-                _detay_img_refs.append(ctk_img)
-                try: root.after(0, lambda: lbl.configure(image=ctk_img, text=""))
-                except: pass
-            except:
-                try: root.after(0, lambda: lbl.configure(text="🖼️"))
-                except: pass
-        threading.Thread(target=_load, args=(gorsel, img_lbl), daemon=True).start()
+    ctk.CTkLabel(card, text=fiyat if fiyat else " ", font=("Segoe UI", 9, "bold"),
+                 text_color="#f1c40f").pack()
 
     if link:
         for w in (card, img_lbl):
             w.bind("<Button-1>", lambda e, l=link: webbrowser.open(l))
+
+    if gorsel and gorsel.startswith("http"):
+        _ref = gorsel.split("/")[0] + "//" + gorsel.split("/")[2] if gorsel.count("/") >= 2 else ""
+        def _load(url, lbl, referer=_ref):
+            with _IMG_SEM:
+                try:
+                    hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"}
+                    if referer:
+                        hdrs["Referer"] = referer
+                    resp = requests.get(url, timeout=10, headers=hdrs)
+                    if resp.status_code == 200 and resp.content:
+                        pil_img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
+                        pil_img.thumbnail((128, 130), PILImage.LANCZOS)
+                        ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img,
+                                               size=(pil_img.width, pil_img.height))
+                        _detay_img_refs.append(ctk_img)
+                        try: root.after(0, lambda lb=lbl, ci=ctk_img: lb.configure(image=ci, text=""))
+                        except: pass
+                        return
+                except: pass
+                try: root.after(0, lambda lb=lbl: lb.configure(text="🖼️", image=""))
+                except: pass
+        threading.Thread(target=_load, args=(gorsel, img_lbl), daemon=True).start()
 
 
 def guncelle_dashboard_kartlari():
