@@ -663,6 +663,346 @@ DEFACTO_JS = r"""() => {
 }"""
 
 
+# ── Zara JSON API (scraping'e gerek yok) ──
+
+def _zara_kategori_id(url: str) -> str:
+    """URL'den Zara kategori ID'sini çıkar: ?v1=2546081 → 2546081"""
+    m = re.search(r'[?&]v1=(\d+)', url)
+    return m.group(1) if m else ""
+
+def _zara_base_path(url: str) -> str:
+    """https://www.zara.com/tr/tr/... → /tr/tr"""
+    parts = url.replace("https://www.zara.com","").split("/")
+    return "/" + "/".join(p for p in parts[:3] if p)
+
+def zara_api_cek(marka_url: str, accept_lang: str) -> list:
+    """Zara REST API ile ürünleri çek — browser gerektirmez."""
+    cat_id = _zara_kategori_id(marka_url)
+    if not cat_id:
+        return []
+    base_path = _zara_base_path(marka_url)
+    origin = "https://www.zara.com"
+    api_url = f"{origin}{base_path}/category/{cat_id}/products?ajax=true"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": accept_lang,
+        "Referer": marka_url,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "sec-ch-ua": '"Chromium";v="124","Google Chrome";v="124","Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    }
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+    except Exception:
+        return []
+
+    urunler = []
+    elements = data if isinstance(data, list) else data.get("elements", data.get("productGroups", []))
+    # productGroups bazlı yanıt
+    if isinstance(elements, list) and elements and isinstance(elements[0], dict):
+        if "elements" in elements[0]:
+            flat = []
+            for grp in elements:
+                flat.extend(grp.get("elements", []))
+            elements = flat
+
+    seen = set()
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        for prod in el.get("commercialComponents", [el]):
+            if not isinstance(prod, dict):
+                continue
+            name = prod.get("name") or ""
+            if not name or len(name) < 2:
+                continue
+            seo = prod.get("seo", {}) or {}
+            seo_url = seo.get("url", "")
+            if seo_url:
+                link = seo_url if seo_url.startswith("http") else origin + seo_url
+            else:
+                keyword = seo.get("keyword", "")
+                if keyword:
+                    link = f"{origin}{base_path}/{keyword}.html"
+                else:
+                    pid = prod.get("id", "")
+                    link = f"{origin}{base_path}/p{pid}.html" if pid else ""
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            gorsel = ""
+            for media in (prod.get("xmedia") or prod.get("images") or []):
+                if isinstance(media, dict):
+                    raw = media.get("url", "") or media.get("path", "")
+                    if raw:
+                        gorsel = (raw if raw.startswith("http") else "https:" + raw)
+                        gorsel = gorsel.split("?")[0] + "?ts=1&w=600&f=auto"
+                        break
+            price_obj = prod.get("price") or {}
+            if isinstance(price_obj, dict):
+                amt = price_obj.get("value") or price_obj.get("formattedAmount") or ""
+                cur = price_obj.get("currency", "")
+                fiyat = f"{amt} {cur}".strip()
+            else:
+                prices = prod.get("prices", [])
+                fiyat = prices[0].get("formattedAmount", "") if prices else ""
+            urunler.append({"isim": name, "fiyat": fiyat, "link": link, "gorsel": gorsel})
+    return urunler
+
+
+# ── Inditex JSON API (Massimo Dutti, Bershka) ──
+def _inditex_kategori_id(url: str) -> str:
+    """URL'den Inditex kategori n-ID'sini çıkar: yenilik-n1474 → 1474"""
+    m = re.search(r'-n(\d+)', url.split('?')[0])
+    return m.group(1) if m else ""
+
+def inditex_api_cek(marka_url: str, accept_lang: str) -> list:
+    """Massimo Dutti / Bershka JSON API ile ürünleri çek."""
+    from urllib.parse import urlparse
+    cat_id = _inditex_kategori_id(marka_url)
+    if not cat_id:
+        return []
+    parsed = urlparse(marka_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    parts = parsed.path.strip("/").split("/")  # ['tr', 'kadin', 'yenilik-n1474']
+    country = parts[0] if len(parts) > 0 else "es"
+    api_url = f"{origin}/{country}/category/{cat_id}/products?ajax=true"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": accept_lang,
+        "Referer": marka_url,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    }
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+    except Exception:
+        return []
+
+    urunler = []
+    elements = data if isinstance(data, list) else data.get("elements", data.get("productGroups", []))
+    if isinstance(elements, list) and elements and isinstance(elements[0], dict) and "elements" in elements[0]:
+        flat = []
+        for grp in elements:
+            flat.extend(grp.get("elements", []))
+        elements = flat
+
+    seen = set()
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        for prod in el.get("commercialComponents", [el]):
+            if not isinstance(prod, dict):
+                continue
+            name = prod.get("name") or ""
+            if not name or len(name) < 2:
+                continue
+            seo = prod.get("seo", {}) or {}
+            seo_url = seo.get("url", "")
+            link = (seo_url if seo_url.startswith("http") else origin + seo_url) if seo_url else ""
+            if not link:
+                keyword = seo.get("keyword", "")
+                if keyword and len(parts) >= 2:
+                    link = f"{origin}/{parts[0]}/{keyword}"
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            gorsel = ""
+            for media in (prod.get("xmedia") or prod.get("images") or []):
+                if isinstance(media, dict):
+                    raw = media.get("url", "") or media.get("path", "")
+                    if raw:
+                        gorsel = (raw if raw.startswith("http") else "https:" + raw)
+                        gorsel = gorsel.split("?")[0] + "?w=600"
+                        break
+            price_obj = prod.get("price") or {}
+            amt = (price_obj.get("value") or price_obj.get("formattedAmount") or "") if isinstance(price_obj, dict) else ""
+            cur = price_obj.get("currency", "") if isinstance(price_obj, dict) else ""
+            urunler.append({"isim": name, "fiyat": f"{amt} {cur}".strip(), "link": link, "gorsel": gorsel})
+    return urunler
+    """URL'den Zara kategori ID'sini çıkar: ?v1=2546081 → 2546081"""
+    m = _re.search(r'[?&]v1=(\d+)', url)
+    return m.group(1) if m else ""
+
+def _zara_base_path(url: str) -> str:
+    """https://www.zara.com/tr/tr/... → /tr/tr"""
+    parts = url.replace("https://www.zara.com","").split("/")
+    return "/" + "/".join(p for p in parts[:3] if p)
+
+def zara_api_cek(marka_url: str, accept_lang: str) -> list:
+    """Zara REST API ile ürünleri çek — browser gerektirmez."""
+    cat_id = _zara_kategori_id(marka_url)
+    if not cat_id:
+        return []
+    base_path = _zara_base_path(marka_url)
+    origin = "https://www.zara.com"
+    api_url = f"{origin}{base_path}/category/{cat_id}/products?ajax=true"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": accept_lang,
+        "Referer": marka_url,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "sec-ch-ua": '"Chromium";v="124","Google Chrome";v="124","Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    }
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+    except Exception:
+        return []
+
+    urunler = []
+    elements = data if isinstance(data, list) else data.get("elements", data.get("productGroups", []))
+    # productGroups bazlı yanıt
+    if isinstance(elements, list) and elements and isinstance(elements[0], dict):
+        # Düz liste mi, yoksa grup listesi mi?
+        if "elements" in elements[0]:
+            flat = []
+            for grp in elements:
+                flat.extend(grp.get("elements", []))
+            elements = flat
+
+    seen = set()
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        # İç içe commercialComponents varsa
+        for prod in el.get("commercialComponents", [el]):
+            if not isinstance(prod, dict):
+                continue
+            name = prod.get("name") or ""
+            if not name or len(name) < 2:
+                continue
+            seo = prod.get("seo", {}) or {}
+            seo_url = seo.get("url", "")
+            if seo_url:
+                link = seo_url if seo_url.startswith("http") else origin + seo_url
+            else:
+                keyword = seo.get("keyword", "")
+                if keyword:
+                    link = f"{origin}{base_path}/{keyword}.html"
+                else:
+                    pid = prod.get("id", "")
+                    link = f"{origin}{base_path}/p{pid}.html" if pid else ""
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            gorsel = ""
+            for media in (prod.get("xmedia") or prod.get("images") or []):
+                if isinstance(media, dict):
+                    raw = media.get("url", "") or media.get("path", "")
+                    if raw:
+                        gorsel = (raw if raw.startswith("http") else "https:" + raw)
+                        gorsel = gorsel.split("?")[0] + "?ts=1&w=600&f=auto"
+                        break
+            price_obj = prod.get("price") or {}
+            if isinstance(price_obj, dict):
+                amt = price_obj.get("value") or price_obj.get("formattedAmount") or ""
+                cur = price_obj.get("currency", "")
+                fiyat = f"{amt} {cur}".strip()
+            else:
+                prices = prod.get("prices", [])
+                fiyat = prices[0].get("formattedAmount", "") if prices else ""
+            urunler.append({"isim": name, "fiyat": fiyat, "link": link, "gorsel": gorsel})
+    return urunler
+
+
+# ── Inditex JSON API (Massimo Dutti, Bershka) ──
+def _inditex_kategori_id(url: str) -> str:
+    """URL'den Inditex kategori n-ID'sini çıkar: yenilik-n1474 → 1474"""
+    m = _re.search(r'-n(\d+)', url.split('?')[0])
+    return m.group(1) if m else ""
+
+def inditex_api_cek(marka_url: str, accept_lang: str) -> list:
+    """Massimo Dutti / Bershka JSON API ile ürünleri çek."""
+    cat_id = _inditex_kategori_id(marka_url)
+    if not cat_id:
+        return []
+    from urllib.parse import urlparse
+    parsed = urlparse(marka_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    parts = parsed.path.strip("/").split("/")  # ['tr', 'kadin', 'yenilik-n1474']
+    country = parts[0] if len(parts) > 0 else "es"
+    api_url = f"{origin}/{country}/category/{cat_id}/products?ajax=true"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": accept_lang,
+        "Referer": marka_url,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    }
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+    except Exception:
+        return []
+
+    urunler = []
+    elements = data if isinstance(data, list) else data.get("elements", data.get("productGroups", []))
+    if isinstance(elements, list) and elements and isinstance(elements[0], dict) and "elements" in elements[0]:
+        flat = []
+        for grp in elements:
+            flat.extend(grp.get("elements", []))
+        elements = flat
+
+    seen = set()
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        for prod in el.get("commercialComponents", [el]):
+            if not isinstance(prod, dict):
+                continue
+            name = prod.get("name") or ""
+            if not name or len(name) < 2:
+                continue
+            seo = prod.get("seo", {}) or {}
+            seo_url = seo.get("url", "")
+            link = (seo_url if seo_url.startswith("http") else origin + seo_url) if seo_url else ""
+            if not link:
+                keyword = seo.get("keyword", "")
+                parts2 = parsed.path.strip("/").split("/")
+                if keyword and len(parts2) >= 2:
+                    link = f"{origin}/{parts2[0]}/{keyword}"
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            gorsel = ""
+            for media in (prod.get("xmedia") or prod.get("images") or []):
+                if isinstance(media, dict):
+                    raw = media.get("url", "") or media.get("path", "")
+                    if raw:
+                        gorsel = (raw if raw.startswith("http") else "https:" + raw)
+                        gorsel = gorsel.split("?")[0] + "?w=600"
+                        break
+            price_obj = prod.get("price") or {}
+            amt = (price_obj.get("value") or price_obj.get("formattedAmount") or "") if isinstance(price_obj, dict) else ""
+            cur = price_obj.get("currency", "") if isinstance(price_obj, dict) else ""
+            urunler.append({"isim": name, "fiyat": f"{amt} {cur}".strip(), "link": link, "gorsel": gorsel})
+    return urunler
+
+
 # ── Locale → Accept-Language haritası ──
 _LANG_MAP = {
     "tr-TR": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -743,6 +1083,16 @@ async def tara(browser, marka):
             urunler = await page.evaluate(SHOPIFY_JS, marka["url"])
 
         elif tip == "zara":
+            # 1. API önce dene (hızlı, bot tespiti yok)
+            loop = asyncio.get_event_loop()
+            urunler = await loop.run_in_executor(
+                None, zara_api_cek, marka["url"], accept_lang)
+            if urunler:
+                log(f"   ✓ {marka['ad']}: {len(urunler)} ürün (API)")
+                await ctx.close()
+                return urunler
+            # 2. API başarısız → browser ile aç
+            log(f"   ⚠️ {marka['ad']}: API boş, browser ile deneniyor...")
             await page.goto(marka["url"], wait_until="networkidle", timeout=55000)
             await page.wait_for_timeout(3000)
             await kapat_popup(page); await page.wait_for_timeout(800); await kapat_popup(page)
@@ -782,6 +1132,16 @@ async def tara(browser, marka):
                 urunler = [u for u in urunler if u.get("link","") and "null" not in u["link"]]
 
         elif tip == "inditex":
+            # 1. API önce dene
+            loop = asyncio.get_event_loop()
+            urunler = await loop.run_in_executor(
+                None, inditex_api_cek, marka["url"], accept_lang)
+            if urunler:
+                log(f"   ✓ {marka['ad']}: {len(urunler)} ürün (API)")
+                await ctx.close()
+                return urunler
+            # 2. API başarısız → browser ile aç
+            log(f"   ⚠️ {marka['ad']}: API boş, browser ile deneniyor...")
             await page.goto(marka["url"], wait_until="networkidle", timeout=55000)
             await page.wait_for_timeout(2500)
             await kapat_popup(page); await page.wait_for_timeout(800); await kapat_popup(page)
@@ -956,8 +1316,25 @@ async def tek_tur_async(tur_no):
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled","--no-sandbox","--disable-dev-shm-usage","--disable-gpu"]
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--window-position=10000,0",   # Pencereyi ekran dışına al
+                "--window-size=1440,900",
+                "--disable-infobars",
+                "--disable-extensions",
+                "--disable-default-apps",
+                "--no-first-run",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--flag-switches-begin",
+                "--flag-switches-end",
+            ]
         )
 
         async def isle(m):
