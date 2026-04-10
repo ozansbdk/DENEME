@@ -1809,10 +1809,10 @@ def _ac_galeri(urunler, baslik):
                      text_color="#f1c40f", anchor="w").place(x=8, y=200)
 
         if link:
-            btn = ctk.CTkButton(card, text="🔗 İncele", height=26, font=("Segoe UI", 10),
+            btn = ctk.CTkButton(card, text="🔗 İncele", width=238, height=26, font=("Segoe UI", 10),
                                 fg_color="#2980b9", hover_color="#3498db",
                                 command=lambda l=link: webbrowser.open(l))
-            btn.place(x=8, y=232, width=238)
+            btn.place(x=8, y=232)
             img_lbl.bind("<Button-1>", lambda e, l=link: webbrowser.open(l))
 
         if gorsel and gorsel.startswith("http"):
